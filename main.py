@@ -6,10 +6,10 @@ Listo para Render: puerto provisto por $PORT (lo toma uvicorn vía start command
 Firebase key vía env var FIREBASE_KEY_B64.
 """
 
-import os, re, base64, uuid, warnings
+import os, re, base64, uuid, warnings, logging, traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -25,13 +25,20 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# (Opcional) Oculta el warning de openpyxl por validaciones extendidas de Excel
+# ───────────────────────────────────────────────────────────────
+# (Opcional) Oculta el warning de openpyxl por validaciones extendidas
 warnings.filterwarnings(
     "ignore",
     message="Data Validation extension is not supported and will be removed",
     category=UserWarning,
     module="openpyxl",
 )
+
+# ───────────────────────────────────────────────────────────────
+# Logging simple
+# ───────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dwc-export")
 
 # ───────────────────────────────────────────────────────────────
 # 📁 PATHS & CONFIG
@@ -97,23 +104,33 @@ def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
             d[k] = v.replace(tzinfo=None)
     return d
 
-def fetch_df(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.DataFrame:
-    """Descarga documentos de una colección; filtra por campanaID si existe."""
-    campana_id = campana_id.strip('"')  # por si viene con comillas
+def fetch_df_exact(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.DataFrame:
+    """Descarga documentos de una colección específica; filtra por campanaID si existe."""
+    campana_id = campana_id.strip('"')
     col_ref = db.collection(col)
-    # Chequeo mínimo para saber si el doc tiene 'campanaID'
     first = list(col_ref.limit(1).stream())
     if not first:
         return pd.DataFrame()
-
     if filter_by_campana and ("campanaID" in first[0].to_dict()):
-        # Nuevo API sin warning deprecado:
         query = col_ref.where(filter=FieldFilter("campanaID", "==", campana_id))
     else:
         query = col_ref
-
     data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in query.stream()]
     return pd.DataFrame(data)
+
+def fetch_df_any(candidates: Iterable[str], campana_id: str) -> pd.DataFrame:
+    """Intenta varias colecciones hasta obtener datos (para tolerar mayúsculas/minúsculas)."""
+    for name in candidates:
+        try:
+            df = fetch_df_exact(name, campana_id)
+            if not df.empty:
+                log.info(f"[fetch_df_any] '{name}' -> {len(df)} filas")
+                return df
+            else:
+                log.info(f"[fetch_df_any] '{name}' sin filas")
+        except Exception as e:
+            log.warning(f"[fetch_df_any] Error leyendo '{name}': {e}")
+    return pd.DataFrame()
 
 def _ymd(dt: Any):
     """Devuelve (año, mes, día) o (None, None, None)."""
@@ -289,20 +306,35 @@ def llenar_plantilla_dwc(
 # 📤 ÚNICO ENDPOINT
 # ───────────────────────────────────────────────────────────────
 @app.get("/export")
-def export_excel(request: Request, campana_id: str = Query(..., description="ID de la campaña a filtrar")):
-    df_campana = fetch_df("campana", campana_id)
-    df_registro = fetch_df("Registro", campana_id)
-    df_metodologia = fetch_df("Metodologia", campana_id)
+def export_excel(
+    request: Request,
+    campana_id: str = Query(..., description="ID de la campaña a filtrar (URL-encode si tiene /)")
+):
+    try:
+        # Intenta con mayúsculas/minúsculas
+        df_campana = fetch_df_any(["campana", "Campana"], campana_id)
+        df_registro = fetch_df_any(["Registro", "registro"], campana_id)
+        df_metodologia = fetch_df_any(["Metodologia", "metodologia"], campana_id)
 
-    if df_campana.empty or df_registro.empty or df_metodologia.empty:
-        raise HTTPException(status_code=404, detail="No hay datos para esta campaña.")
+        log.info(f"[export] filas -> campana={len(df_campana)}, registro={len(df_registro)}, metodologia={len(df_metodologia)}")
 
-    filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
-    path = llenar_plantilla_dwc(df_campana, df_metodologia, df_registro, filename)
+        if df_campana.empty or df_registro.empty or df_metodologia.empty:
+            raise HTTPException(status_code=404, detail="No hay datos para esta campaña (verifique colecciones e ID).")
 
-    base_url = str(request.base_url).rstrip("/")
-    download_url = f"{base_url}/downloads/{os.path.basename(path)}"
-    return JSONResponse({"download_url": download_url})
+        filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
+        path = llenar_plantilla_dwc(df_campana, df_metodologia, df_registro, filename)
+
+        base_url = str(request.base_url).rstrip("/")
+        download_url = f"{base_url}/downloads/{os.path.basename(path)}"
+        return JSONResponse({"download_url": download_url})
+
+    except HTTPException:
+        # re-lanza tal cual
+        raise
+    except Exception as e:
+        # log full stack y responde 500 limpio (Swagger a veces lo muestra como 502 a través del proxy)
+        log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
 
 # Healthcheck + HEAD (para limpiar logs en Render)
 @app.head("/")
@@ -313,3 +345,21 @@ def head_root():
 def root():
     return {"status": "ok", "service": "Exporter DwC-SMA"}
 
+# ───────────────────────────────────────────────────────────────
+# 🔎 Endpoints de diagnóstico (puedes quitarlos luego)
+# ───────────────────────────────────────────────────────────────
+@app.get("/check")
+def check():
+    return {
+        "template_exists": Path(RUTA_PLANTILLA).exists(),
+        "template_path": RUTA_PLANTILLA,
+        "download_dir": DOWNLOAD_DIR,
+    }
+
+@app.get("/peek")
+def peek(campana_id: str):
+    return {
+        "campana_rows": len(fetch_df_any(["campana", "Campana"], campana_id)),
+        "registro_rows": len(fetch_df_any(["Registro", "registro"], campana_id)),
+        "metodologia_rows": len(fetch_df_any(["Metodologia", "metodologia"], campana_id)),
+    }

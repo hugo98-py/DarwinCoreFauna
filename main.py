@@ -57,27 +57,32 @@ app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
-# 🌐 CORS (ajustado para FlutterFlow)
-#   Evita usar allow_origins=["*"] con allow_credentials=True.
-#   Por defecto habilita dominios de FF; o usa CORS_ORIGINS en Render.
+# 🌐 CORS (robusto p/ FlutterFlow)
+#   - Permite orígenes explícitos (env CORS_ORIGINS) y además un REGEX
+#     para cualquier subdominio de *.flutterflow.app y *.web.app.
+#   - allow_credentials=True, sin wildcard (*) para que el navegador no bloquee.
 # ───────────────────────────────────────────────────────────────
-FF_DEFAULTS = [
+ff_defaults = [
     "https://preview.flutterflow.app",
     "https://app.flutterflow.io",
 ]
 cors_env = os.getenv("CORS_ORIGINS", "").strip()
 if cors_env:
-    origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+    allow_origins = [o.strip() for o in cors_env.split(",") if o.strip()]
 else:
-    origins = FF_DEFAULTS
+    allow_origins = ff_defaults
+
+# Abarca p.ej. https://algo.flutterflow.app, https://miapp.web.app, etc.
+allow_origin_regex = r"^https:\/\/([a-z0-9-]+\.)*(flutterflow\.app|web\.app)$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,         # credenciales OK porque no usamos wildcard
-    allow_methods=["GET", "OPTIONS"],
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=True,                 # OK porque no usamos wildcard
+    allow_methods=["GET", "OPTIONS"],       # suficiente
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],  # opcional
+    expose_headers=["Content-Disposition"], # opcional
 )
 
 # ───────────────────────────────────────────────────────────────

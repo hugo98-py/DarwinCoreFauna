@@ -3,13 +3,13 @@
 FastAPI: Exporta Excel DwC-SMA desde Firestore y entrega URL de descarga.
 ÚNICO endpoint público: /export -> {"download_url": "..."} (sirve estáticos en /downloads)
 Listo para Render (puerto vía $PORT). Firebase key vía env var FIREBASE_KEY_B64.
+SIN manejo de encoding: compara campanaID == campana_id tal cual llega.
 """
 
 import os, re, base64, uuid, warnings, logging, traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterable, List
-from urllib.parse import unquote, quote
+from typing import Any, Dict, Iterable
 
 import numpy as np
 import pandas as pd
@@ -41,13 +41,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("dwc-export")
 
 # ───────────────────────────────────────────────────────────────
-# 📁 PATHS & CONFIG
+# PATHS & CONFIG
 # ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
-
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", (ROOT / "downloads").as_posix())
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
+# Si no defines RUTA_PLANTILLA, se asume que el archivo está al lado de main.py
 RUTA_PLANTILLA = os.getenv(
     "RUTA_PLANTILLA",
     (ROOT / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx").as_posix()
@@ -56,11 +56,8 @@ RUTA_PLANTILLA = os.getenv(
 app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-# ───────────────────────────────────────────────────────────────
-# 🌐 CORS
-# ───────────────────────────────────────────────────────────────
-cors_env = os.getenv("CORS_ORIGINS", "").strip()
-origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else ["*"]
+# CORS (ajusta en producción)
+origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins, allow_credentials=True,
@@ -68,7 +65,7 @@ app.add_middleware(
 )
 
 # ───────────────────────────────────────────────────────────────
-# 🔥 FIREBASE INIT
+# FIREBASE INIT
 # ───────────────────────────────────────────────────────────────
 FIREBASE_KEY_B64 = os.getenv("FIREBASE_KEY_B64")
 if not FIREBASE_KEY_B64:
@@ -81,41 +78,10 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ───────────────────────────────────────────────────────────────
-# 🔧 UTILS
+# UTILS
 # ───────────────────────────────────────────────────────────────
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
-
-def _urldecode_all(s: str, max_loops: int = 3) -> str:
-    """Decodifica %xx repetidamente (tolera %2F, %252F, etc.)."""
-    prev = s
-    for _ in range(max_loops):
-        cur = unquote(prev)
-        if cur == prev:
-            break
-        prev = cur
-    return cur.strip()
-
-def _campana_id_variants(raw_id: str) -> List[str]:
-    """
-    Genera variantes del campana_id para igualar lo que haya en Firestore:
-    - original decodificado
-    - encode 1 vez
-    - encode 2 veces
-    - reemplazos directos por %2F / %252F
-    """
-    base = _urldecode_all(raw_id)                 # "Z..._29/7/2025"
-    v = [base]
-    v.append(quote(base, safe=""))                # "Z..._29%2F7%2F2025"
-    v.append(quote(v[-1], safe=""))               # "Z..._29%252F7%252F2025"
-    v.append(base.replace("/", "%2F"))
-    v.append(base.replace("/", "%252F"))
-    # quita duplicados preservando orden
-    seen, out = set(), []
-    for x in v:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
 
 def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in d.items():
@@ -124,30 +90,28 @@ def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 def fetch_df_exact(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.DataFrame:
-    """Lee una colección. Si tiene 'campanaID', intenta varias variantes del ID."""
+    """
+    Lee una colección. Si tiene 'campanaID', filtra por igualdad EXACTA (sin encoding).
+    """
+    campana_id = campana_id.strip().strip('"')
     col_ref = db.collection(col)
     first = list(col_ref.limit(1).stream())
     if not first:
         return pd.DataFrame()
 
     if filter_by_campana and ("campanaID" in first[0].to_dict()):
-        # probamos varias variantes (por si el valor en Firestore quedó encodeado)
-        for cid in _campana_id_variants(campana_id):
-            try:
-                q = col_ref.where(filter=FieldFilter("campanaID", "==", cid))
-                data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in q.stream()]
-                if data:
-                    log.info(f"[{col}] match con campanaID='{cid}' -> {len(data)} filas")
-                    return pd.DataFrame(data)
-            except Exception as e:
-                log.warning(f"[{col}] error probando '{cid}': {e}")
-        # sin match
-        return pd.DataFrame()
+        q = col_ref.where(filter=FieldFilter("campanaID", "==", campana_id))
+        data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in q.stream()]
+        return pd.DataFrame(data)
     else:
         data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in col_ref.stream()]
         return pd.DataFrame(data)
 
 def fetch_df_any(candidates: Iterable[str], campana_id: str) -> pd.DataFrame:
+    """
+    Prueba con nombres de colección alternativos (mayúsc/minúsc).
+    SIN variantes del ID; compara tal cual llega.
+    """
     for name in candidates:
         try:
             df = fetch_df_exact(name, campana_id)
@@ -202,7 +166,7 @@ def _coerce_time(df: pd.DataFrame) -> pd.Series:
     )
 
 # ───────────────────────────────────────────────────────────────
-# ✍️ LLENADO PLANTILLA
+# LLENADO PLANTILLA
 # ───────────────────────────────────────────────────────────────
 def llenar_plantilla_dwc(
     df_campana: pd.DataFrame,
@@ -344,7 +308,7 @@ def llenar_plantilla_dwc(
         'Reino': _col(df_r, ["reino", "Reino"], ""),
         'Filo o división': _col(df_r, ["division", "Filo o división", "filo"], ""),
         'Clase': _col(df_r, ["clase", "Clase"], ""),
-        'Orden': _col(df_r, ["orden", "Orden"], ""),
+        'Orden': _col[df_r, ["orden", "Orden"]].iloc[0] if "orden" in df_r.columns or "Orden" in df_r.columns else _col(df_r, ["orden"], ""),  # fallback seguro
         'Familia': _col(df_r, ["familia", "Familia"], ""),
         'Género': _col(df_r, ["genero", "Género"], ""),
         'Nombre común': _col(df_r, ["nombreComun", "Nombre común", "nameSp"], ""),
@@ -353,8 +317,8 @@ def llenar_plantilla_dwc(
         'Tipo de cuantificación': _col(df_r, ["tipoCuantificación", "tipoCuantificacion"], ""),
         'Valor': _col(df_r, ["valor", "Valor"], ""),
         'Unidad de valor': _col(df_r, ["unidadValor", "Unidad de valor"], ""),
-        'Latitud decimal registro': coords.map(get_lat) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
-        'Longitud decimal registro': coords.map(get_lon) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
+        'Latitud decimal registro': coords.map(lambda c: getattr(c, "latitude", None)) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
+        'Longitud decimal registro': coords.map(lambda c: getattr(c, "longitude", None)) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
         'Hora registro': df_r["Time"].dt.strftime("%H:%M"),
         'Condición reproductiva': _col(df_r, ["condicionReproductiva", "Condición reproductiva"], ""),
         'Sexo (Fauna)': _col(df_r, ["sexo", "Sexo (Fauna)"], ""),
@@ -375,16 +339,15 @@ def llenar_plantilla_dwc(
     return out_path
 
 # ───────────────────────────────────────────────────────────────
-# 📤 ÚNICO ENDPOINT PÚBLICO
+# ÚNICO ENDPOINT
 # ───────────────────────────────────────────────────────────────
 @app.get("/export")
 def export_excel(
     request: Request,
-    campana_id: str = Query(..., description="ID de la campaña (con /, %2F o %252F; el server lo normaliza)")
+    campana_id: str = Query(..., description="ID de la campaña (igual al guardado en campanaID)")
 ):
     try:
-        # Normaliza por si viene encodeado (incluso doble)
-        campana_id = _urldecode_all(campana_id)
+        campana_id = campana_id.strip().strip('"')
 
         df_campana = fetch_df_any(["campana", "Campana"], campana_id)
         df_registro = fetch_df_any(["Registro", "registro"], campana_id)
@@ -393,7 +356,18 @@ def export_excel(
         log.info(f"[export] filas -> campana={len(df_campana)}, registro={len(df_registro)}, metodologia={len(df_metodologia)}")
 
         if df_campana.empty or df_registro.empty or df_metodologia.empty:
-            raise HTTPException(status_code=404, detail="No hay datos para esta campaña (verifique colecciones e ID).")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": "No hay datos para esta campaña (verifique colecciones/ID exacto).",
+                    "campana_id": campana_id,
+                    "filas": {
+                        "campana": len(df_campana),
+                        "registro": len(df_registro),
+                        "metodologia": len(df_metodologia),
+                    },
+                },
+            )
 
         filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
         path = llenar_plantilla_dwc(df_campana, df_metodologia, df_registro, filename)

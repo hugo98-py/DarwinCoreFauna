@@ -308,7 +308,7 @@ def llenar_plantilla_dwc(
         'Reino': _col(df_r, ["reino", "Reino"], ""),
         'Filo o división': _col(df_r, ["division", "Filo o división", "filo"], ""),
         'Clase': _col(df_r, ["clase", "Clase"], ""),
-        'Orden': _col[df_r, ["orden", "Orden"]].iloc[0] if "orden" in df_r.columns or "Orden" in df_r.columns else _col(df_r, ["orden"], ""),  # fallback seguro
+        'Orden': _col(df_r, ["orden", "Orden"], ""),  # ← FIX: llamar _col(...), sin subscript ni iloc
         'Familia': _col(df_r, ["familia", "Familia"], ""),
         'Género': _col(df_r, ["genero", "Género"], ""),
         'Nombre común': _col(df_r, ["nombreComun", "Nombre común", "nameSp"], ""),
@@ -381,3 +381,4 @@ def export_excel(
     except Exception as e:
         log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
+

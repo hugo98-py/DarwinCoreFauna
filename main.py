@@ -44,7 +44,9 @@ log = logging.getLogger("dwc-export")
 # PATHS & CONFIG
 # ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", (ROOT / "downloads").as_posix())
+
+# 👉 Cambiamos el default a /tmp (más robusto en Render)
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 # Si no defines RUTA_PLANTILLA, se asume que el archivo está al lado de main.py
@@ -58,9 +60,6 @@ app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
 # 🌐 CORS (robusto p/ FlutterFlow)
-#   - Permite orígenes explícitos (env CORS_ORIGINS) y además un REGEX
-#     para cualquier subdominio de *.flutterflow.app y *.web.app.
-#   - allow_credentials=True, sin wildcard (*) para que el navegador no bloquee.
 # ───────────────────────────────────────────────────────────────
 ff_defaults = [
     "https://preview.flutterflow.app",
@@ -72,17 +71,16 @@ if cors_env:
 else:
     allow_origins = ff_defaults
 
-# Abarca p.ej. https://algo.flutterflow.app, https://miapp.web.app, etc.
 allow_origin_regex = r"^https:\/\/([a-z0-9-]+\.)*(flutterflow\.app|web\.app)$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
     allow_origin_regex=allow_origin_regex,
-    allow_credentials=True,                 # OK porque no usamos wildcard
-    allow_methods=["GET", "OPTIONS"],       # suficiente
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"], # opcional
+    expose_headers=["Content-Disposition"],
 )
 
 # ───────────────────────────────────────────────────────────────
@@ -201,6 +199,7 @@ def llenar_plantilla_dwc(
             f"cwd={Path.cwd().as_posix()} ROOT={ROOT.as_posix()}."
         )
 
+    log.info(f"[plantilla] usando: {RUTA_PLANTILLA}")
     wb = load_workbook(RUTA_PLANTILLA)
 
     # Campaña
@@ -337,14 +336,16 @@ def llenar_plantilla_dwc(
         'Identificado por': "AMS Consultores",
     })
 
-    ws_o = wb["Ocurrencia"]
+    out_path = os.path.join(DOWNLOAD_DIR, filename_out)
+    log.info(f"[save] guardando Excel en: {out_path}")
+    wb_o = wb["Ocurrencia"]
     for i in range(len(dfRegistroTMP)):
         row_excel = i + 3
         for col_name, col_idx in campos_regitro_dwc.items():
-            ws_o.cell(row=row_excel, column=col_idx, value=dfRegistroTMP.loc[i, col_name])
+            wb_o.cell(row=row_excel, column=col_idx, value=dfRegistroTMP.loc[i, col_name])
 
-    out_path = os.path.join(DOWNLOAD_DIR, filename_out)
     wb.save(out_path)
+    log.info(f"[save] Excel guardado OK: {out_path}")
     return out_path
 
 # ───────────────────────────────────────────────────────────────
@@ -383,6 +384,7 @@ def export_excel(
 
         base_url = str(request.base_url).rstrip("/")
         download_url = f"{base_url}/downloads/{os.path.basename(path)}"
+        log.info(f"[export] URL de descarga: {download_url}")
         return JSONResponse({"download_url": download_url})
 
     except HTTPException:
@@ -390,3 +392,8 @@ def export_excel(
     except Exception as e:
         log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
+
+# Health simple para que Render y tú vean 200
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Exporter DwC-SMA"}

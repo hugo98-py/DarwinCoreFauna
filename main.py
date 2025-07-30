@@ -8,8 +8,8 @@ Listo para Render (puerto vía $PORT). Firebase key vía env var FIREBASE_KEY_B6
 import os, re, base64, uuid, warnings, logging, traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterable
-from urllib.parse import unquote
+from typing import Any, Dict, Iterable, List
+from urllib.parse import unquote, quote
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,7 @@ from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 # ───────────────────────────────────────────────────────────────
-# OpenPyXL: silenciar warning por validaciones extendidas (opcional)
+# OpenPyXL: silenciar warning (opcional)
 warnings.filterwarnings(
     "ignore",
     message="Data Validation extension is not supported and will be removed",
@@ -48,7 +48,6 @@ ROOT = Path(__file__).resolve().parent
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", (ROOT / "downloads").as_posix())
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-# Si no defines RUTA_PLANTILLA, se asume que el archivo está al lado de main.py
 RUTA_PLANTILLA = os.getenv(
     "RUTA_PLANTILLA",
     (ROOT / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx").as_posix()
@@ -58,32 +57,27 @@ app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
-# 🌐 CORS (ajusta en producción)
+# 🌐 CORS
 # ───────────────────────────────────────────────────────────────
 cors_env = os.getenv("CORS_ORIGINS", "").strip()
 origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else ["*"]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins, allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # ───────────────────────────────────────────────────────────────
-# 🔥 FIREBASE INIT (desde env var)
+# 🔥 FIREBASE INIT
 # ───────────────────────────────────────────────────────────────
 FIREBASE_KEY_B64 = os.getenv("FIREBASE_KEY_B64")
 if not FIREBASE_KEY_B64:
     raise RuntimeError("No se encontró la variable de entorno FIREBASE_KEY_B64.")
-
 if not firebase_admin._apps:
     cred_path = ROOT / "firebase_key.json"
     with open(cred_path, "wb") as f:
         f.write(base64.b64decode(FIREBASE_KEY_B64))
     firebase_admin.initialize_app(credentials.Certificate(cred_path.as_posix()))
-
 db = firestore.client()
 
 # ───────────────────────────────────────────────────────────────
@@ -93,7 +87,7 @@ def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
 
 def _urldecode_all(s: str, max_loops: int = 3) -> str:
-    """Decodifica %xx repetidamente para tolerar encode doble/triple."""
+    """Decodifica %xx repetidamente (tolera %2F, %252F, etc.)."""
     prev = s
     for _ in range(max_loops):
         cur = unquote(prev)
@@ -102,29 +96,58 @@ def _urldecode_all(s: str, max_loops: int = 3) -> str:
         prev = cur
     return cur.strip()
 
+def _campana_id_variants(raw_id: str) -> List[str]:
+    """
+    Genera variantes del campana_id para igualar lo que haya en Firestore:
+    - original decodificado
+    - encode 1 vez
+    - encode 2 veces
+    - reemplazos directos por %2F / %252F
+    """
+    base = _urldecode_all(raw_id)                 # "Z..._29/7/2025"
+    v = [base]
+    v.append(quote(base, safe=""))                # "Z..._29%2F7%2F2025"
+    v.append(quote(v[-1], safe=""))               # "Z..._29%252F7%252F2025"
+    v.append(base.replace("/", "%2F"))
+    v.append(base.replace("/", "%252F"))
+    # quita duplicados preservando orden
+    seen, out = set(), []
+    for x in v:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
 def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Quita tzinfo de datetimes (evita problemas al serializar)."""
     for k, v in d.items():
         if isinstance(v, datetime) and v.tzinfo:
             d[k] = v.replace(tzinfo=None)
     return d
 
 def fetch_df_exact(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.DataFrame:
-    """Descarga documentos de una colección específica; filtra por campanaID si existe."""
-    campana_id = campana_id.strip('"')
+    """Lee una colección. Si tiene 'campanaID', intenta varias variantes del ID."""
     col_ref = db.collection(col)
     first = list(col_ref.limit(1).stream())
     if not first:
         return pd.DataFrame()
+
     if filter_by_campana and ("campanaID" in first[0].to_dict()):
-        query = col_ref.where(filter=FieldFilter("campanaID", "==", campana_id))
+        # probamos varias variantes (por si el valor en Firestore quedó encodeado)
+        for cid in _campana_id_variants(campana_id):
+            try:
+                q = col_ref.where(filter=FieldFilter("campanaID", "==", cid))
+                data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in q.stream()]
+                if data:
+                    log.info(f"[{col}] match con campanaID='{cid}' -> {len(data)} filas")
+                    return pd.DataFrame(data)
+            except Exception as e:
+                log.warning(f"[{col}] error probando '{cid}': {e}")
+        # sin match
+        return pd.DataFrame()
     else:
-        query = col_ref
-    data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in query.stream()]
-    return pd.DataFrame(data)
+        data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in col_ref.stream()]
+        return pd.DataFrame(data)
 
 def fetch_df_any(candidates: Iterable[str], campana_id: str) -> pd.DataFrame:
-    """Intenta varias colecciones hasta obtener datos (para tolerar mayúsculas/minúsculas)."""
     for name in candidates:
         try:
             df = fetch_df_exact(name, campana_id)
@@ -138,7 +161,6 @@ def fetch_df_any(candidates: Iterable[str], campana_id: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _ymd(dt: Any):
-    """Devuelve (año, mes, día) o (None, None, None)."""
     try:
         if pd.isna(dt):
             return None, None, None
@@ -147,21 +169,18 @@ def _ymd(dt: Any):
         return None, None, None
 
 def _pick_or_fail(df: pd.DataFrame, canonical: str, candidates: list) -> pd.Series:
-    """Devuelve una serie asegurando una de las columnas; lanza error amigable si no existe."""
     for c in candidates:
         if c in df.columns:
             return df[c]
     raise KeyError(f"Falta columna requerida '{canonical}'. Candidatas: {candidates}. Presentes: {list(df.columns)}")
 
 def _col(df: pd.DataFrame, candidates: list, default="") -> pd.Series:
-    """Devuelve la primera columna existente; si no hay, devuelve un valor por defecto."""
     for c in candidates:
         if c in df.columns:
             return df[c]
     return pd.Series([default] * len(df))
 
 def _coerce_time(df: pd.DataFrame) -> pd.Series:
-    """Crea/obtiene columna de tiempo a partir de varios esquemas posibles."""
     if "Time" in df.columns:
         return pd.to_datetime(df["Time"], errors="coerce")
     for c in ["registroDate", "date"]:
@@ -179,11 +198,11 @@ def _coerce_time(df: pd.DataFrame) -> pd.Series:
         return pd.to_datetime(s, errors="coerce")
     raise KeyError(
         "No se encontró ninguna columna de fecha/hora válida. "
-        "Opciones soportadas: Time, registroDate, date, o las 4 registroAnoDate/registrosMesDate/registrosDiaDate/registrosHoraDate."
+        "Opciones: Time, registroDate, date, o las 4 registroAnoDate/registrosMesDate/registrosDiaDate/registrosHoraDate."
     )
 
 # ───────────────────────────────────────────────────────────────
-# ✍️ LLENADO PLANTILLA DwC-SMA
+# ✍️ LLENADO PLANTILLA
 # ───────────────────────────────────────────────────────────────
 def llenar_plantilla_dwc(
     df_campana: pd.DataFrame,
@@ -194,13 +213,12 @@ def llenar_plantilla_dwc(
     if not Path(RUTA_PLANTILLA).exists():
         raise FileNotFoundError(
             f"No se encontró la plantilla en '{RUTA_PLANTILLA}'. "
-            f"cwd={Path.cwd().as_posix()} ROOT={ROOT.as_posix()}. "
-            "Súbela al repo o define RUTA_PLANTILLA como variable de entorno."
+            f"cwd={Path.cwd().as_posix()} ROOT={ROOT.as_posix()}."
         )
 
     wb = load_workbook(RUTA_PLANTILLA)
 
-    # ── Campaña (mapea nombres alternativos)
+    # Campaña
     df_c = df_campana.copy()
     name = _pick_or_fail(df_c, "Name", ["Name", "nameCamp", "Nombre campaña", "NombreCampaña"])
     ncamp = _pick_or_fail(df_c, "ncampana", ["ncampana", "nCampana", "numeroCampana", "Número de campaña"])
@@ -234,7 +252,7 @@ def llenar_plantilla_dwc(
     for col, val in dataCamp.items():
         ws_c.cell(row=3, column=dic_camp[col], value=val)
 
-    # ── EstacionReplica
+    # EstacionReplica
     df_m = df_metodologia.copy()
     df_m["Type"] = _col(df_m, ["Type", "type", "Tipo", "Tipo de monitoreo"], default="Transecto")
     df_m["nameest"] = _col(df_m, ["nameest", "nameEst", "Nombre estación", "nombreEst"], default="")
@@ -270,7 +288,7 @@ def llenar_plantilla_dwc(
         for col_name in cols_out_est:
             ws_e.cell(row=row_excel, column=campos_estacion_replica[col_name], value=dfMetodologiaTMP.loc[i, col_name])
 
-    # ── Ocurrencia
+    # Ocurrencia
     df_r = df_registro.copy()
     df_r["Time"] = _coerce_time(df_r)
 
@@ -348,7 +366,7 @@ def llenar_plantilla_dwc(
 
     ws_o = wb["Ocurrencia"]
     for i in range(len(dfRegistroTMP)):
-        row_excel = i + 3  # asume 2 filas de meta + encabezado
+        row_excel = i + 3
         for col_name, col_idx in campos_regitro_dwc.items():
             ws_o.cell(row=row_excel, column=col_idx, value=dfRegistroTMP.loc[i, col_name])
 
@@ -362,13 +380,12 @@ def llenar_plantilla_dwc(
 @app.get("/export")
 def export_excel(
     request: Request,
-    campana_id: str = Query(..., description="ID de la campaña (con o sin %2F; el server lo normaliza)")
+    campana_id: str = Query(..., description="ID de la campaña (con /, %2F o %252F; el server lo normaliza)")
 ):
     try:
-        # Normaliza por si viene URL-encodeado (incluso doble)
+        # Normaliza por si viene encodeado (incluso doble)
         campana_id = _urldecode_all(campana_id)
 
-        # Tolerancia a mayúsculas/minúsculas en nombres de colección
         df_campana = fetch_df_any(["campana", "Campana"], campana_id)
         df_registro = fetch_df_any(["Registro", "registro"], campana_id)
         df_metodologia = fetch_df_any(["Metodologia", "metodologia"], campana_id)

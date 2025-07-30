@@ -30,10 +30,7 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Pon la plantilla en tu repo (p. ej., ./plantillas/archivo.xlsx)
-RUTA_PLANTILLA = os.getenv(
-    "RUTA_PLANTILLA",
-    "plantillas/FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx"
-)
+RUTA_PLANTILLA = "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx"
 
 app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")

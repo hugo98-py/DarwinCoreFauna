@@ -6,14 +6,15 @@ Listo para Render: puerto provisto por $PORT (lo toma uvicorn vía start command
 Firebase key vía env var FIREBASE_KEY_B64.
 """
 
-import os, re, base64, uuid
+import os, re, base64, uuid, warnings
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +23,29 @@ from openpyxl import load_workbook
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+
+# (Opcional) Oculta el warning de openpyxl por validaciones extendidas de Excel
+warnings.filterwarnings(
+    "ignore",
+    message="Data Validation extension is not supported and will be removed",
+    category=UserWarning,
+    module="openpyxl",
+)
 
 # ───────────────────────────────────────────────────────────────
-# 📁 CONFIG
+# 📁 PATHS & CONFIG
 # ───────────────────────────────────────────────────────────────
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+ROOT = Path(__file__).resolve().parent
 
-# Pon la plantilla en tu repo (p. ej., ./plantillas/archivo.xlsx)
-RUTA_PLANTILLA = "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx"
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", (ROOT / "downloads").as_posix())
+Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+
+# Si no defines RUTA_PLANTILLA, se asume que el archivo está al lado de main.py
+RUTA_PLANTILLA = os.getenv(
+    "RUTA_PLANTILLA",
+    (ROOT / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx").as_posix()
+)
 
 app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
@@ -62,10 +77,10 @@ if not FIREBASE_KEY_B64:
     raise RuntimeError("No se encontró la variable de entorno FIREBASE_KEY_B64.")
 
 if not firebase_admin._apps:
-    cred_path = "firebase_key.json"
+    cred_path = ROOT / "firebase_key.json"
     with open(cred_path, "wb") as f:
         f.write(base64.b64decode(FIREBASE_KEY_B64))
-    firebase_admin.initialize_app(credentials.Certificate(cred_path))
+    firebase_admin.initialize_app(credentials.Certificate(cred_path.as_posix()))
 
 db = firestore.client()
 
@@ -86,12 +101,14 @@ def fetch_df(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.Da
     """Descarga documentos de una colección; filtra por campanaID si existe."""
     campana_id = campana_id.strip('"')  # por si viene con comillas
     col_ref = db.collection(col)
+    # Chequeo mínimo para saber si el doc tiene 'campanaID'
     first = list(col_ref.limit(1).stream())
     if not first:
         return pd.DataFrame()
 
-    if filter_by_campana and "campanaID" in first[0].to_dict():
-        query = col_ref.where("campanaID", "==", campana_id)
+    if filter_by_campana and ("campanaID" in first[0].to_dict()):
+        # Nuevo API sin warning deprecado:
+        query = col_ref.where(filter=FieldFilter("campanaID", "==", campana_id))
     else:
         query = col_ref
 
@@ -116,9 +133,11 @@ def llenar_plantilla_dwc(
     df_registro: pd.DataFrame,
     filename_out: str
 ) -> str:
-    if not os.path.exists(RUTA_PLANTILLA):
+    # Verificación clara con contexto útil
+    if not Path(RUTA_PLANTILLA).exists():
         raise FileNotFoundError(
             f"No se encontró la plantilla en '{RUTA_PLANTILLA}'. "
+            f"cwd={Path.cwd().as_posix()} ROOT={ROOT.as_posix()}. "
             "Súbela al repo o define RUTA_PLANTILLA como variable de entorno."
         )
 
@@ -285,7 +304,11 @@ def export_excel(request: Request, campana_id: str = Query(..., description="ID 
     download_url = f"{base_url}/downloads/{os.path.basename(path)}"
     return JSONResponse({"download_url": download_url})
 
-# Healthcheck simple (útil en Render)
+# Healthcheck + HEAD (para limpiar logs en Render)
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Exporter DwC-SMA"}

@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI: Exporta Excel DwC-SMA desde Firestore y entrega URL de descarga.
-ÚNICO endpoint público: /export -> {"download_url": "..."} (sirve estáticos en /downloads)
-Listo para Render (puerto vía $PORT). Firebase key vía env var FIREBASE_KEY_B64.
-SIN manejo de encoding: compara campanaID == campana_id tal cual llega.
+FastAPI robusto para FlutterFlow:
+- /export => devuelve job_id + status_url + download_url (respuesta inmediata)
+- Genera Excel en background y sirve archivos estáticos en /downloads
+- CORS amplio por defecto (puedes restringir con CORS_ORIGINS)
 """
 
-import os, re, base64, uuid, warnings, logging, traceback
+import os, re, base64, uuid, warnings, logging, traceback, threading, time
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,11 +45,9 @@ log = logging.getLogger("dwc-export")
 # ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
 
-# 👉 Cambiamos el default a /tmp (más robusto en Render)
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-# Si no defines RUTA_PLANTILLA, se asume que el archivo está al lado de main.py
 RUTA_PLANTILLA = os.getenv(
     "RUTA_PLANTILLA",
     (ROOT / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx").as_posix()
@@ -59,26 +57,20 @@ app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
-# 🌐 CORS (robusto p/ FlutterFlow)
+# 🌐 CORS: amplio por defecto (browser-friendly)
+#     - En prod, usa CORS_ORIGINS="https://tu-dominio1,https://tu-dominio2"
 # ───────────────────────────────────────────────────────────────
-ff_defaults = [
-    "https://preview.flutterflow.app",
-    "https://app.flutterflow.io",
-]
 cors_env = os.getenv("CORS_ORIGINS", "").strip()
 if cors_env:
     allow_origins = [o.strip() for o in cors_env.split(",") if o.strip()]
 else:
-    allow_origins = ff_defaults
-
-allow_origin_regex = r"^https:\/\/([a-z0-9-]+\.)*(flutterflow\.app|web\.app)$"
+    allow_origins = ["*"]  # amplio para evitar “Failed to fetch” por CORS en FF
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=True,
-    allow_methods=["GET", "OPTIONS"],
+    allow_credentials=False,         # si pones True, no puedes usar "*"
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
@@ -97,6 +89,36 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ───────────────────────────────────────────────────────────────
+# JOB STORE en memoria
+# ───────────────────────────────────────────────────────────────
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 60 * 60  # limpiar trabajos viejos (1 h)
+
+def _job_set(job_id: str, **kwargs):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id, {})
+        job.update(kwargs)
+        JOBS[job_id] = job
+
+def _job_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
+
+def _job_cleanup():
+    now = time.time()
+    to_del = []
+    with JOBS_LOCK:
+        for jid, job in JOBS.items():
+            ts = job.get("ts", now)
+            if (now - ts) > JOB_TTL_SECONDS:
+                to_del.append(jid)
+        for jid in to_del:
+            del JOBS[jid]
+    if to_del:
+        log.info(f"[jobs] limpiados {len(to_del)} jobs expuestos")
+
+# ───────────────────────────────────────────────────────────────
 # UTILS
 # ───────────────────────────────────────────────────────────────
 def _safe_filename(s: str) -> str:
@@ -109,15 +131,11 @@ def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 def fetch_df_exact(col: str, campana_id: str, filter_by_campana: bool = True) -> pd.DataFrame:
-    """
-    Lee una colección. Si tiene 'campanaID', filtra por igualdad EXACTA (sin encoding).
-    """
     campana_id = campana_id.strip().strip('"')
     col_ref = db.collection(col)
     first = list(col_ref.limit(1).stream())
     if not first:
         return pd.DataFrame()
-
     if filter_by_campana and ("campanaID" in first[0].to_dict()):
         q = col_ref.where(filter=FieldFilter("campanaID", "==", campana_id))
         data = [clean_datetimes(doc.to_dict() | {"id": doc.id}) for doc in q.stream()]
@@ -127,10 +145,6 @@ def fetch_df_exact(col: str, campana_id: str, filter_by_campana: bool = True) ->
         return pd.DataFrame(data)
 
 def fetch_df_any(candidates: Iterable[str], campana_id: str) -> pd.DataFrame:
-    """
-    Prueba con nombres de colección alternativos (mayúsc/minúsc).
-    SIN variantes del ID; compara tal cual llega.
-    """
     for name in candidates:
         try:
             df = fetch_df_exact(name, campana_id)
@@ -349,21 +363,17 @@ def llenar_plantilla_dwc(
     return out_path
 
 # ───────────────────────────────────────────────────────────────
-# ÚNICO ENDPOINT
+# WORKER DEL JOB (background)
 # ───────────────────────────────────────────────────────────────
-@app.get("/export")
-def export_excel(
-    request: Request,
-    campana_id: str = Query(..., description="ID de la campaña (igual al guardado en campanaID)")
-):
+def _run_job(job_id: str, campana_id: str, base_url: str):
     try:
-        campana_id = campana_id.strip().strip('"')
+        _job_set(job_id, ts=time.time(), ready=False, error=None, download_url=None)
 
         df_campana = fetch_df_any(["campana", "Campana"], campana_id)
         df_registro = fetch_df_any(["Registro", "registro"], campana_id)
         df_metodologia = fetch_df_any(["Metodologia", "metodologia"], campana_id)
 
-        log.info(f"[export] filas -> campana={len(df_campana)}, registro={len(df_registro)}, metodologia={len(df_metodologia)}")
+        log.info(f"[job {job_id}] filas -> campana={len(df_campana)}, registro={len(df_registro)}, metodologia={len(df_metodologia)}")
 
         if df_campana.empty or df_registro.empty or df_metodologia.empty:
             raise HTTPException(
@@ -382,18 +392,57 @@ def export_excel(
         filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
         path = llenar_plantilla_dwc(df_campana, df_metodologia, df_registro, filename)
 
-        base_url = str(request.base_url).rstrip("/")
-        download_url = f"{base_url}/downloads/{os.path.basename(path)}"
-        log.info(f"[export] URL de descarga: {download_url}")
-        return JSONResponse({"download_url": download_url})
+        base = base_url.rstrip("/")
+        download_url = f"{base}/downloads/{os.path.basename(path)}"
+        _job_set(job_id, ready=True, download_url=download_url, error=None)
+        log.info(f"[job {job_id}] listo: {download_url}")
 
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        _job_set(job_id, ready=True, error=he.detail, download_url=None)
+        log.warning(f"[job {job_id}] HTTPException: {he.detail}")
     except Exception as e:
-        log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
+        _job_set(job_id, ready=True, error=str(e), download_url=None)
+        log.error(f"[job {job_id}] ERROR: {e}\n{traceback.format_exc()}")
+    finally:
+        _job_cleanup()
 
-# Health simple para que Render y tú vean 200
+# ───────────────────────────────────────────────────────────────
+# ENDPOINTS
+# ───────────────────────────────────────────────────────────────
+@app.get("/export")
+def export_excel(
+    request: Request,
+    campana_id: str = Query(..., description="ID de la campaña (igual al guardado en campanaID)"),
+    background_tasks: BackgroundTasks = None
+):
+    # Responder rápido para que FF no corte por timeout
+    campana_id = campana_id.strip().strip('"')
+    job_id = uuid.uuid4().hex
+    base_url = str(request.base_url)
+
+    _job_set(job_id, ts=time.time(), ready=False, error=None, download_url=None, campana_id=campana_id)
+    if background_tasks is not None:
+        background_tasks.add_task(_run_job, job_id, campana_id, base_url)
+    else:
+        # fallback (no debería pasar en FastAPI real)
+        threading.Thread(target=_run_job, args=(job_id, campana_id, base_url), daemon=True).start()
+
+    status_url = f"{base_url.rstrip('/')}/status/{job_id}"
+    # Nota: el archivo aún no existe; el cliente debe consultar status_url hasta ready=true
+    return JSONResponse({"job_id": job_id, "ready": False, "status_url": status_url})
+
+@app.get("/status/{job_id}")
+def job_status(job_id: str):
+    job = _job_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado o expirado.")
+    return JSONResponse({
+        "job_id": job_id,
+        "ready": bool(job.get("ready")),
+        "download_url": job.get("download_url"),
+        "error": job.get("error"),
+    })
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Exporter DwC-SMA"}

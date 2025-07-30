@@ -9,7 +9,7 @@ Firebase key vía env var FIREBASE_KEY_B64.
 import os, re, base64, uuid, warnings, logging, traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Iterable, Optional
+from typing import Any, Dict, Iterable
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,7 @@ warnings.filterwarnings(
 )
 
 # ───────────────────────────────────────────────────────────────
-# Logging simple
+# Logging
 # ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dwc-export")
@@ -58,9 +58,7 @@ app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
-# 🌐 CORS (opcional; útil para FlutterFlow/Web)
-# Define CORS_ORIGINS="https://tuapp.web.app,https://app.flutterflow.io" en Render
-# o déjalo vacío para permitir todo (solo para pruebas)
+# 🌐 CORS (opcional)
 # ───────────────────────────────────────────────────────────────
 cors_env = os.getenv("CORS_ORIGINS", "").strip()
 if cors_env:
@@ -141,6 +139,49 @@ def _ymd(dt: Any):
     except Exception:
         return None, None, None
 
+def _pick_or_fail(df: pd.DataFrame, canonical: str, candidates: list) -> pd.Series:
+    """Devuelve una serie asegurando una de las columnas; lanza error amigable si no existe."""
+    for c in candidates:
+        if c in df.columns:
+            return df[c]
+    raise KeyError(f"Falta columna requerida '{canonical}'. Candidatas: {candidates}. Presentes: {list(df.columns)}")
+
+def _col(df: pd.DataFrame, candidates: list, default="") -> pd.Series:
+    """Devuelve la primera columna existente; si no hay, devuelve un valor por defecto."""
+    for c in candidates:
+        if c in df.columns:
+            return df[c]
+    return pd.Series([default] * len(df))
+
+def _coerce_time(df: pd.DataFrame) -> pd.Series:
+    """Crea/obtiene columna de tiempo a partir de varios esquemas posibles."""
+    # 1) Columna 'Time' directa
+    if "Time" in df.columns:
+        return pd.to_datetime(df["Time"], errors="coerce")
+
+    # 2) Campo 'registroDate' o 'date'
+    for c in ["registroDate", "date"]:
+        if c in df.columns:
+            return pd.to_datetime(df[c], errors="coerce")
+
+    # 3) Campos descompuestos: año/mes/día/hora (si existen)
+    parts = ["registroAnoDate", "registrosMesDate", "registrosDiaDate", "registrosHoraDate"]
+    if all(p in df.columns for p in parts):
+        # Construye un string YYYY-MM-DD HH:MM
+        hhmm = df["registrosHoraDate"].astype(str).str.zfill(5)  # asume "H:MM" o "HH:MM"
+        s = (
+            df["registroAnoDate"].astype(str) + "-" +
+            df["registrosMesDate"].astype(str).str.zfill(2) + "-" +
+            df["registrosDiaDate"].astype(str).str.zfill(2) + " " +
+            hhmm
+        )
+        return pd.to_datetime(s, errors="coerce")
+
+    raise KeyError(
+        "No se encontró ninguna columna de fecha/hora válida. "
+        "Opciones soportadas: Time, registroDate, date, o las 4 registroAnoDate/registrosMesDate/registrosDiaDate/registrosHoraDate."
+    )
+
 # ───────────────────────────────────────────────────────────────
 # ✍️ LLENADO PLANTILLA DwC-SMA
 # ───────────────────────────────────────────────────────────────
@@ -160,16 +201,23 @@ def llenar_plantilla_dwc(
 
     wb = load_workbook(RUTA_PLANTILLA)
 
-    # ── Campaña
-    if len(df_campana) > 1:
-        df_campana = pd.DataFrame(df_campana.iloc[0, :]).T
-    for required_col in ["startDateCamp", "endDateCamp", "Name", "ncampana"]:
-        if required_col not in df_campana.columns:
-            raise KeyError(f"Falta columna requerida en df_campana: '{required_col}'")
-    df_campana["startDateCamp"] = pd.to_datetime(df_campana["startDateCamp"], errors="coerce")
-    df_campana["endDateCamp"]   = pd.to_datetime(df_campana["endDateCamp"],   errors="coerce")
-    y_i, m_i, d_i = _ymd(df_campana.loc[0, "startDateCamp"])
-    y_t, m_t, d_t = _ymd(df_campana.loc[0, "endDateCamp"])
+    # ── Campaña (mapea nombres alternativos)
+    df_c = df_campana.copy()
+    name = _pick_or_fail(df_c, "Name", ["Name", "nameCamp", "Nombre campaña", "Nombre campaña", "NombreCampaña"])
+    ncamp = _pick_or_fail(df_c, "ncampana", ["ncampana", "nCampana", "numeroCampana", "Número de campaña"])
+    start = _pick_or_fail(df_c, "startDateCamp", ["startDateCamp", "startDate", "Fecha de inicio de la campaña"])
+    end   = _pick_or_fail(df_c, "endDateCamp",   ["endDateCamp", "endDate", "Fecha de término de la campaña"])
+
+    df_c["Name"] = name
+    df_c["ncampana"] = ncamp
+    df_c["startDateCamp"] = pd.to_datetime(start, errors="coerce")
+    df_c["endDateCamp"]   = pd.to_datetime(end,   errors="coerce")
+
+    if len(df_c) > 1:
+        df_c = pd.DataFrame(df_c.iloc[0, :]).T
+
+    y_i, m_i, d_i = _ymd(df_c.loc[0, "startDateCamp"])
+    y_t, m_t, d_t = _ymd(df_c.loc[0, "endDateCamp"])
 
     ws_c = wb["Campaña"]
     dic_camp = {
@@ -179,21 +227,24 @@ def llenar_plantilla_dwc(
     }
     dataCamp = {
         'ID Campaña': 1,
-        'Nombre campaña': df_campana.loc[0, "Name"],
-        'Número de campaña': df_campana.loc[0, "ncampana"],
+        'Nombre campaña': df_c.loc[0, "Name"],
+        'Número de campaña': df_c.loc[0, "ncampana"],
         'Año inicio': y_i, 'Mes inicio': m_i, 'Día inicio': d_i,
         'Año término': y_t, 'Mes término': m_t, 'Día término': d_t
     }
     for col, val in dataCamp.items():
         ws_c.cell(row=3, column=dic_camp[col], value=val)
 
-    # ── EstacionReplica
-    if "nameest" not in df_metodologia.columns or "Type" not in df_metodologia.columns:
-        raise KeyError("Faltan columnas 'nameest' o 'Type' en df_metodologia")
+    # ── EstacionReplica (tolera 'Type'/'type' y 'nameest'/'nameEst')
+    df_m = df_metodologia.copy()
+    df_m["Type"] = _col(df_m, ["Type", "type", "Tipo", "Tipo de monitoreo"], default="Transecto")
+    df_m["nameest"] = _col(df_m, ["nameest", "nameEst", "Nombre estación", "Nombre estación", "nombreEst"], default="")
 
-    df_metodologia = df_metodologia.copy()
-    df_metodologia["Número Réplica"] = df_metodologia.groupby(["nameest", "Type"]).cumcount() + 1
-    df_metodologia["ID EstacionReplica"] = np.arange(1, len(df_metodologia) + 1)
+    if df_m["nameest"].isna().all():
+        raise KeyError("Faltan columnas 'nameest'/'nameEst' en df_metodologia")
+
+    df_m["Número Réplica"] = df_m.groupby(["nameest", "Type"]).cumcount() + 1
+    df_m["ID EstacionReplica"] = np.arange(1, len(df_m) + 1)
 
     campos_estacion_replica = {
         "ID EstacionReplica": 1, "Nombre estación": 2, "Tipo de monitoreo": 3,
@@ -202,18 +253,18 @@ def llenar_plantilla_dwc(
         "Región": 16, "Provincia": 17, "Comuna": 18, "Localidad": 19
     }
 
-    df_metodologia["Tipo de monitoreo"] = "Transecto"  # ajusta si corresponde
-    df_metodologia["Nombre estación"] = df_metodologia.get("nameest", "")
-    df_metodologia["Descripción EstacionReplica"] = df_metodologia.get("Observaciones", "")
-    df_metodologia["Ancho (m)"] = df_metodologia.get("Ancho", "")
-    df_metodologia["Radio (m)"] = df_metodologia.get("Radio", "")
-    df_metodologia["Región"] = df_metodologia.get("region", "")
-    df_metodologia["Provincia"] = df_metodologia.get("provincia", "")
-    df_metodologia["Comuna"] = df_metodologia.get("comuna", "")
-    df_metodologia["Localidad"] = df_metodologia.get("localidad", "")
+    df_m["Tipo de monitoreo"] = df_m["Type"]
+    df_m["Nombre estación"] = df_m["nameest"]
+    df_m["Descripción EstacionReplica"] = _col(df_m, ["Observaciones", "descripcion", "Descripción"], default="")
+    df_m["Ancho (m)"] = _col(df_m, ["Ancho", "ancho"], default="")
+    df_m["Radio (m)"] = _col(df_m, ["Radio", "radio"], default="")
+    df_m["Región"] = _col(df_m, ["region", "Región"], default="")
+    df_m["Provincia"] = _col(df_m, ["provincia", "Provincia"], default="")
+    df_m["Comuna"] = _col(df_m, ["comuna", "Comuna"], default="")
+    df_m["Localidad"] = _col(df_m, ["localidad", "Localidad"], default="")
 
     cols_out_est = list(campos_estacion_replica.keys())
-    dfMetodologiaTMP = df_metodologia.reindex(columns=(cols_out_est + ["metodologiaID"]))
+    dfMetodologiaTMP = df_m.reindex(columns=(cols_out_est + ["metodologiaID"]))
 
     ws_e = wb["EstacionReplica"]
     for i in range(len(dfMetodologiaTMP)):
@@ -221,30 +272,32 @@ def llenar_plantilla_dwc(
         for col_name in cols_out_est:
             ws_e.cell(row=row_excel, column=campos_estacion_replica[col_name], value=dfMetodologiaTMP.loc[i, col_name])
 
-    # ── Ocurrencia
-    if "Time" not in df_registro.columns:
-        raise KeyError("Falta columna 'Time' en df_registro")
+    # ── Ocurrencia (tolera múltiples esquemas de fecha/hora y nombres alternativos)
+    df_r = df_registro.copy()
+    df_r["Time"] = _coerce_time(df_r)
 
-    df_reg = df_registro.copy()
-    df_reg["Time"] = pd.to_datetime(df_reg["Time"], errors="coerce")
-
-    # Map metodologíaID → ID EstacionReplica
+    # Mapeo metodologíaID → ID EstacionReplica
     id_map = {}
-    if "metodologiaID" in df_reg.columns and "metodologiaID" in dfMetodologiaTMP.columns:
+    if "metodologiaID" in df_r.columns and "metodologiaID" in dfMetodologiaTMP.columns:
         for _, r in dfMetodologiaTMP.iterrows():
             id_map[r.get("metodologiaID")] = r.get("ID EstacionReplica")
 
     def mapValuesId_safe(met_id):
         return id_map.get(met_id, None)
 
-    # GeoPoint → lat/lon
     def get_lat(coord):
-        try: return coord.latitude
-        except Exception: return None
+        try:
+            return coord.latitude
+        except Exception:
+            return None
 
     def get_lon(coord):
-        try: return coord.longitude
-        except Exception: return None
+        try:
+            return coord.longitude
+        except Exception:
+            return None
+
+    coords = _col(df_r, ["Coordinates", "coordinates", "coord"], default=None)
 
     campos_regitro_dwc = {
         'ID Campaña': 1, 'ID EstacionReplica': 3,
@@ -263,31 +316,34 @@ def llenar_plantilla_dwc(
 
     dfRegistroTMP = pd.DataFrame({
         'ID Campaña': 1,
-        'ID EstacionReplica': df_reg.get("metodologiaID", pd.Series([None]*len(df_reg))).map(mapValuesId_safe),
-        'Año del evento': df_reg["Time"].dt.year,
-        'Mes del evento': df_reg["Time"].dt.month,
-        'Día del evento': df_reg["Time"].dt.day,
-        'Hora inicio evento (hh:mm)': df_reg["Time"].dt.strftime("%H:%M"),
-        'Protocolo de muestreo': df_reg.get("protocoloMuestreo", ""),
-        'Tamaño de la muestra': df_reg.get("tamanoMuestra", ""),
-        'Unidad del tamaño de la muestra': df_reg.get("unidadTamanoMuestra", ""),
-        'Comentarios del evento': df_reg.get("comentario", ""),
-        'Reino': df_reg.get("reino", ""), 'Filo o división': df_reg.get("division", ""),
-        'Clase': df_reg.get("clase", ""), 'Orden': df_reg.get("orden", ""),
-        'Familia': df_reg.get("familia", ""), 'Género': df_reg.get("genero", ""),
-        'Nombre común': df_reg.get("nombreComun", ""),
-        'Estado del organismo': df_reg.get("estadoOrganismo", ""),
-        'Parámetro': df_reg.get("parametro", ""),
-        'Tipo de cuantificación': df_reg.get("tipoCuantificación", ""),
-        'Valor': df_reg.get("valor", ""),
-        'Unidad de valor': df_reg.get("unidadValor", ""),
-        'Latitud decimal registro': df_reg.get("Coordinates", pd.Series([None]*len(df_reg))).map(get_lat),
-        'Longitud decimal registro': df_reg.get("Coordinates", pd.Series([None]*len(df_reg))).map(get_lon),
-        'Hora registro': df_reg["Time"].dt.strftime("%H:%M"),
-        'Condición reproductiva': df_reg.get("condicionReproductiva", ""),
-        'Sexo (Fauna)': df_reg.get("sexo", ""),
-        'Etapa de vida (Fauna)': df_reg.get("etapaVida", ""),
-        'Tipo de registro': df_reg.get("tipoRegistro", ""),
+        'ID EstacionReplica': _col(df_r, ["metodologiaID"]).map(mapValuesId_safe),
+        'Año del evento': df_r["Time"].dt.year,
+        'Mes del evento': df_r["Time"].dt.month,
+        'Día del evento': df_r["Time"].dt.day,
+        'Hora inicio evento (hh:mm)': df_r["Time"].dt.strftime("%H:%M"),
+        'Protocolo de muestreo': _col(df_r, ["protocoloMuestreo", "Protocolo de muestreo"], ""),
+        'Tamaño de la muestra': _col(df_r, ["tamanoMuestra", "tamañoMuestra", "tamano", "tamaño"], ""),
+        'Unidad del tamaño de la muestra': _col(df_r, ["unidadTamanoMuestra", "unidadTamañoMuestra"], ""),
+        'Comentarios del evento': _col(df_r, ["comentario", "comentarios", "Comentarios registro"], ""),
+        'Reino': _col(df_r, ["reino", "Reino"], ""),
+        'Filo o división': _col(df_r, ["division", "Filo o división", "filo"], ""),
+        'Clase': _col(df_r, ["clase", "Clase"], ""),
+        'Orden': _col(df_r, ["orden", "Orden"], ""),
+        'Familia': _col(df_r, ["familia", "Familia"], ""),
+        'Género': _col(df_r, ["genero", "Género"], ""),
+        'Nombre común': _col(df_r, ["nombreComun", "Nombre común", "nameSp"], ""),
+        'Estado del organismo': _col(df_r, ["estadoOrganismo", "Estado del organismo"], ""),
+        'Parámetro': _col(df_r, ["parametro", "Parámetro"], ""),
+        'Tipo de cuantificación': _col(df_r, ["tipoCuantificación", "tipoCuantificacion"], ""),
+        'Valor': _col(df_r, ["valor", "Valor"], ""),
+        'Unidad de valor': _col(df_r, ["unidadValor", "Unidad de valor"], ""),
+        'Latitud decimal registro': coords.map(get_lat) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
+        'Longitud decimal registro': coords.map(get_lon) if isinstance(coords, pd.Series) else pd.Series([None]*len(df_r)),
+        'Hora registro': df_r["Time"].dt.strftime("%H:%M"),
+        'Condición reproductiva': _col(df_r, ["condicionReproductiva", "Condición reproductiva"], ""),
+        'Sexo (Fauna)': _col(df_r, ["sexo", "Sexo (Fauna)"], ""),
+        'Etapa de vida (Fauna)': _col(df_r, ["etapaVida", "Etapa de vida (Fauna)"], ""),
+        'Tipo de registro': _col(df_r, ["tipoRegistro", "Tipo de registro"], ""),
         'Muestreado por': "AMS Consultores",
         'Identificado por': "AMS Consultores",
     })
@@ -329,10 +385,8 @@ def export_excel(
         return JSONResponse({"download_url": download_url})
 
     except HTTPException:
-        # re-lanza tal cual
         raise
     except Exception as e:
-        # log full stack y responde 500 limpio (Swagger a veces lo muestra como 502 a través del proxy)
         log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
 

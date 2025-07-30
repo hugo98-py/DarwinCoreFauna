@@ -56,12 +56,28 @@ RUTA_PLANTILLA = os.getenv(
 app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-# CORS (ajusta en producción)
-origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] or ["*"]
+# ───────────────────────────────────────────────────────────────
+# 🌐 CORS (ajustado para FlutterFlow)
+#   Evita usar allow_origins=["*"] con allow_credentials=True.
+#   Por defecto habilita dominios de FF; o usa CORS_ORIGINS en Render.
+# ───────────────────────────────────────────────────────────────
+FF_DEFAULTS = [
+    "https://preview.flutterflow.app",
+    "https://app.flutterflow.io",
+]
+cors_env = os.getenv("CORS_ORIGINS", "").strip()
+if cors_env:
+    origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+else:
+    origins = FF_DEFAULTS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=origins,
+    allow_credentials=True,         # credenciales OK porque no usamos wildcard
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],  # opcional
 )
 
 # ───────────────────────────────────────────────────────────────
@@ -265,18 +281,6 @@ def llenar_plantilla_dwc(
     def mapValuesId_safe(met_id):
         return id_map.get(met_id, None)
 
-    def get_lat(coord):
-        try:
-            return coord.latitude
-        except Exception:
-            return None
-
-    def get_lon(coord):
-        try:
-            return coord.longitude
-        except Exception:
-            return None
-
     coords = _col(df_r, ["Coordinates", "coordinates", "coord"], default=None)
 
     campos_regitro_dwc = {
@@ -308,7 +312,7 @@ def llenar_plantilla_dwc(
         'Reino': _col(df_r, ["reino", "Reino"], ""),
         'Filo o división': _col(df_r, ["division", "Filo o división", "filo"], ""),
         'Clase': _col(df_r, ["clase", "Clase"], ""),
-        'Orden': _col(df_r, ["orden", "Orden"], ""),  # ← FIX: llamar _col(...), sin subscript ni iloc
+        'Orden': _col(df_r, ["orden", "Orden"], ""),
         'Familia': _col(df_r, ["familia", "Familia"], ""),
         'Género': _col(df_r, ["genero", "Género"], ""),
         'Nombre común': _col(df_r, ["nombreComun", "Nombre común", "nameSp"], ""),
@@ -381,4 +385,3 @@ def export_excel(
     except Exception as e:
         log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
-

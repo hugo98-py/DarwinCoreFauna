@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI: Exporta Excel DwC-SMA desde Firestore y entrega URL de descarga.
-ÚNICO endpoint: /export -> {"download_url": "..."} (sirve estáticos en /downloads)
-Listo para Render: puerto provisto por $PORT (lo toma uvicorn vía start command).
-Firebase key vía env var FIREBASE_KEY_B64.
+ÚNICO endpoint público: /export -> {"download_url": "..."} (sirve estáticos en /downloads)
+Listo para Render (puerto vía $PORT). Firebase key vía env var FIREBASE_KEY_B64.
 """
 
 import os, re, base64, uuid, warnings, logging, traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Iterable
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Query, Request, HTTPException, Response
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +26,7 @@ from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 # ───────────────────────────────────────────────────────────────
-# (Opcional) Oculta el warning de openpyxl por validaciones extendidas
+# OpenPyXL: silenciar warning por validaciones extendidas (opcional)
 warnings.filterwarnings(
     "ignore",
     message="Data Validation extension is not supported and will be removed",
@@ -58,13 +58,10 @@ app = FastAPI(title="Exporter DwC-SMA")
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
 # ───────────────────────────────────────────────────────────────
-# 🌐 CORS (opcional)
+# 🌐 CORS (ajusta en producción)
 # ───────────────────────────────────────────────────────────────
 cors_env = os.getenv("CORS_ORIGINS", "").strip()
-if cors_env:
-    origins = [o.strip() for o in cors_env.split(",") if o.strip()]
-else:
-    origins = ["*"]  # relajado para pruebas; ajusta en prod
+origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,6 +91,16 @@ db = firestore.client()
 # ───────────────────────────────────────────────────────────────
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
+
+def _urldecode_all(s: str, max_loops: int = 3) -> str:
+    """Decodifica %xx repetidamente para tolerar encode doble/triple."""
+    prev = s
+    for _ in range(max_loops):
+        cur = unquote(prev)
+        if cur == prev:
+            break
+        prev = cur
+    return cur.strip()
 
 def clean_datetimes(d: Dict[str, Any]) -> Dict[str, Any]:
     """Quita tzinfo de datetimes (evita problemas al serializar)."""
@@ -155,20 +162,14 @@ def _col(df: pd.DataFrame, candidates: list, default="") -> pd.Series:
 
 def _coerce_time(df: pd.DataFrame) -> pd.Series:
     """Crea/obtiene columna de tiempo a partir de varios esquemas posibles."""
-    # 1) Columna 'Time' directa
     if "Time" in df.columns:
         return pd.to_datetime(df["Time"], errors="coerce")
-
-    # 2) Campo 'registroDate' o 'date'
     for c in ["registroDate", "date"]:
         if c in df.columns:
             return pd.to_datetime(df[c], errors="coerce")
-
-    # 3) Campos descompuestos: año/mes/día/hora (si existen)
     parts = ["registroAnoDate", "registrosMesDate", "registrosDiaDate", "registrosHoraDate"]
     if all(p in df.columns for p in parts):
-        # Construye un string YYYY-MM-DD HH:MM
-        hhmm = df["registrosHoraDate"].astype(str).str.zfill(5)  # asume "H:MM" o "HH:MM"
+        hhmm = df["registrosHoraDate"].astype(str).str.zfill(5)
         s = (
             df["registroAnoDate"].astype(str) + "-" +
             df["registrosMesDate"].astype(str).str.zfill(2) + "-" +
@@ -176,7 +177,6 @@ def _coerce_time(df: pd.DataFrame) -> pd.Series:
             hhmm
         )
         return pd.to_datetime(s, errors="coerce")
-
     raise KeyError(
         "No se encontró ninguna columna de fecha/hora válida. "
         "Opciones soportadas: Time, registroDate, date, o las 4 registroAnoDate/registrosMesDate/registrosDiaDate/registrosHoraDate."
@@ -191,7 +191,6 @@ def llenar_plantilla_dwc(
     df_registro: pd.DataFrame,
     filename_out: str
 ) -> str:
-    # Verificación clara con contexto útil
     if not Path(RUTA_PLANTILLA).exists():
         raise FileNotFoundError(
             f"No se encontró la plantilla en '{RUTA_PLANTILLA}'. "
@@ -203,7 +202,7 @@ def llenar_plantilla_dwc(
 
     # ── Campaña (mapea nombres alternativos)
     df_c = df_campana.copy()
-    name = _pick_or_fail(df_c, "Name", ["Name", "nameCamp", "Nombre campaña", "Nombre campaña", "NombreCampaña"])
+    name = _pick_or_fail(df_c, "Name", ["Name", "nameCamp", "Nombre campaña", "NombreCampaña"])
     ncamp = _pick_or_fail(df_c, "ncampana", ["ncampana", "nCampana", "numeroCampana", "Número de campaña"])
     start = _pick_or_fail(df_c, "startDateCamp", ["startDateCamp", "startDate", "Fecha de inicio de la campaña"])
     end   = _pick_or_fail(df_c, "endDateCamp",   ["endDateCamp", "endDate", "Fecha de término de la campaña"])
@@ -235,11 +234,10 @@ def llenar_plantilla_dwc(
     for col, val in dataCamp.items():
         ws_c.cell(row=3, column=dic_camp[col], value=val)
 
-    # ── EstacionReplica (tolera 'Type'/'type' y 'nameest'/'nameEst')
+    # ── EstacionReplica
     df_m = df_metodologia.copy()
     df_m["Type"] = _col(df_m, ["Type", "type", "Tipo", "Tipo de monitoreo"], default="Transecto")
-    df_m["nameest"] = _col(df_m, ["nameest", "nameEst", "Nombre estación", "Nombre estación", "nombreEst"], default="")
-
+    df_m["nameest"] = _col(df_m, ["nameest", "nameEst", "Nombre estación", "nombreEst"], default="")
     if df_m["nameest"].isna().all():
         raise KeyError("Faltan columnas 'nameest'/'nameEst' en df_metodologia")
 
@@ -272,7 +270,7 @@ def llenar_plantilla_dwc(
         for col_name in cols_out_est:
             ws_e.cell(row=row_excel, column=campos_estacion_replica[col_name], value=dfMetodologiaTMP.loc[i, col_name])
 
-    # ── Ocurrencia (tolera múltiples esquemas de fecha/hora y nombres alternativos)
+    # ── Ocurrencia
     df_r = df_registro.copy()
     df_r["Time"] = _coerce_time(df_r)
 
@@ -359,15 +357,18 @@ def llenar_plantilla_dwc(
     return out_path
 
 # ───────────────────────────────────────────────────────────────
-# 📤 ÚNICO ENDPOINT
+# 📤 ÚNICO ENDPOINT PÚBLICO
 # ───────────────────────────────────────────────────────────────
 @app.get("/export")
 def export_excel(
     request: Request,
-    campana_id: str = Query(..., description="ID de la campaña a filtrar (URL-encode si tiene /)")
+    campana_id: str = Query(..., description="ID de la campaña (con o sin %2F; el server lo normaliza)")
 ):
     try:
-        # Intenta con mayúsculas/minúsculas
+        # Normaliza por si viene URL-encodeado (incluso doble)
+        campana_id = _urldecode_all(campana_id)
+
+        # Tolerancia a mayúsculas/minúsculas en nombres de colección
         df_campana = fetch_df_any(["campana", "Campana"], campana_id)
         df_registro = fetch_df_any(["Registro", "registro"], campana_id)
         df_metodologia = fetch_df_any(["Metodologia", "metodologia"], campana_id)
@@ -389,31 +390,3 @@ def export_excel(
     except Exception as e:
         log.error("[export] ERROR: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Fallo exportando Excel: {e}")
-
-# Healthcheck + HEAD (para limpiar logs en Render)
-@app.head("/")
-def head_root():
-    return Response(status_code=200)
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "Exporter DwC-SMA"}
-
-# ───────────────────────────────────────────────────────────────
-# 🔎 Endpoints de diagnóstico (puedes quitarlos luego)
-# ───────────────────────────────────────────────────────────────
-@app.get("/check")
-def check():
-    return {
-        "template_exists": Path(RUTA_PLANTILLA).exists(),
-        "template_path": RUTA_PLANTILLA,
-        "download_dir": DOWNLOAD_DIR,
-    }
-
-@app.get("/peek")
-def peek(campana_id: str):
-    return {
-        "campana_rows": len(fetch_df_any(["campana", "Campana"], campana_id)),
-        "registro_rows": len(fetch_df_any(["Registro", "registro"], campana_id)),
-        "metodologia_rows": len(fetch_df_any(["Metodologia", "metodologia"], campana_id)),
-    }

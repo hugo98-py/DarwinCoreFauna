@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
+firebase-admin
+google-cloud-firestore
 pandas
 numpy
-openpyxl
-firebase-admin
+openpyxl[lxml]
+python-multipart

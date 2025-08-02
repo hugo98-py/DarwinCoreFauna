@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI · Exportador Excel DwC-SMA
-  • Descarga datos Firestore y rellena la plantilla oficial (.xlsx).
-  • Mantiene 100 % el formato porque edita celda-por-celda (openpyxl+lxml).
-  • Endpoint único:  /export?campana_id=…   →  {"download_url": "..."}
-Pensado para Render.com:
-  • FIREBASE_KEY_B64 se pasa como env-var (no se escribe a disco).
-  • Archivos generados se guardan en /tmp (persisten mientras viva el pod).
+FastAPI · Exportador Excel DwC-SMA (Render-ready)
+------------------------------------------------
+• Rellena la plantilla oficial DwC-SMA (.xlsx) con datos de Firestore.
+• Mantiene 100 % el formato (openpyxl+lxml, edición celda-por-celda).
+• Endpoint único:   /export?campana_id=…   →  {"download_url": "..."}
+• Descargas servidas desde  /downloads/<archivo.xlsx>
+
+Claves de producción:
+  ▸ FIREBASE_KEY_B64   – variable de entorno con el JSON de la service-account
+                         codificado en base-64 (una sola línea).
+  ▸ Plantilla .xlsx     – debe residir junto a este archivo en el repo.
+  ▸ Render Free plan    – ficheros de salida se guardan en /tmp.
+
+Nuevo: middleware CORS para que peticiones desde navegadores no fallen.
 """
 
-import os, re, base64, uuid, json, warnings
+import os, re, base64, json, uuid, warnings
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -19,30 +26,40 @@ import pandas as pd
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware  # ← NEW
 from openpyxl import load_workbook
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
-# ────────────────────────────────  Rutas del proyecto
+# ────────────────────────────────  Rutas & constantes
 ROOT_DIR      = Path(__file__).parent
 TEMPLATE_PATH = ROOT_DIR / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx"
 DOWNLOAD_DIR  = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# ────────────────────────────────  Clave Firebase (env var)
+# ────────────────────────────────  Firebase Init
 B64 = os.environ.get("FIREBASE_KEY_B64")
 if not B64:
-    raise RuntimeError("FIREBASE_KEY_B64 environment variable is required")
+    raise RuntimeError("FIREBASE_KEY_B64 env var is required")
 
 cred_info = json.loads(base64.b64decode(B64))
 if not firebase_admin._apps:
     firebase_admin.initialize_app(credentials.Certificate(cred_info))
 db = firestore.client()
 
-# ────────────────────────────────  FastAPI
+# ────────────────────────────────  FastAPI + CORS
 app = FastAPI(title="Exporter DwC-SMA")
+
+# ➜ MIDDLEWARE CORS (abierto a cualquier origen; ajusta si quieres)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # poner tu dominio en producción
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
 
 # ────────────────────────────────  Utilidades
@@ -59,7 +76,7 @@ def fetch_df(collection: str, campana_id: str) -> pd.DataFrame:
     if not docs:
         return pd.DataFrame()
 
-    # Filtra si los documentos tienen el campo campanaID
+    # Si el documento tiene campanaID, filtramos
     if "campanaID" in docs[0].to_dict():
         ref = ref.where("campanaID", "==", campana_id)
 
@@ -74,25 +91,26 @@ def ymd(dt: Any):
     except Exception:
         return None, None, None
 
-# ────────────────────────────────  Rellenar plantilla
+# ────────────────────────────────  Generar Excel
 def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     wb   = load_workbook(TEMPLATE_PATH)
     ws_c = wb["Campaña"]
     ws_e = wb["EstacionReplica"]
     ws_o = wb["Ocurrencia"]
 
-    # CAMPANA ────────────────────────────────────────────────
+    # 1. Campaña -------------------------------------------------
     camp = df_camp.iloc[0].copy()
     camp["startDateCamp"] = pd.to_datetime(camp["startDateCamp"], errors="coerce")
     camp["endDateCamp"]   = pd.to_datetime(camp["endDateCamp"],   errors="coerce")
     y_i,m_i,d_i = ymd(camp["startDateCamp"])
     y_t,m_t,d_t = ymd(camp["endDateCamp"])
 
-    valores = [1, camp["Name"], camp["ncampana"], y_i,m_i,d_i, y_t,m_t,d_t]
-    for col, val in enumerate(valores, 1):
+    for col,val in enumerate(
+        [1, camp["Name"], camp["ncampana"], y_i,m_i,d_i, y_t,m_t,d_t], 1
+    ):
         ws_c.cell(row=3, column=col, value=val)
 
-    # ESTACIONREPLICA (fila 2) ──────────────────────────────
+    # 2. EstacionReplica (datos desde fila 2) --------------------
     df_met = df_met.copy()
     df_met["Número Réplica"]     = df_met.groupby(["nameest","Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1)
@@ -118,14 +136,14 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
             df_met[c] = ""
 
     if ws_e.max_row > 1:
-        ws_e.delete_rows(2, ws_e.max_row - 1)   # deja solo cabecera grande
+        ws_e.delete_rows(2, ws_e.max_row - 1)
 
     for i, row in df_met.iterrows():
         excel_row = i + 2
         for col, idx in cols_e.items():
             ws_e.cell(row=excel_row, column=idx, value=row[col])
 
-    # OCURRENCIA ─────────────────────────────────────────────
+    # 3. Ocurrencia ---------------------------------------------
     df_reg = df_reg.copy()
     df_reg["Time"] = pd.to_datetime(df_reg["Time"], errors="coerce")
 
@@ -137,7 +155,6 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_reg["Día del evento"]             = df_reg["Time"].dt.day
     df_reg["Hora inicio evento (hh:mm)"] = df_reg["Time"].dt.strftime("%H:%M")
     df_reg["Hora registro"]              = df_reg["Hora inicio evento (hh:mm)"]
-
     df_reg["Latitud decimal registro"]   = df_reg["Coordinates"].apply(lambda c: getattr(c,"latitude",None))
     df_reg["Longitud decimal registro"]  = df_reg["Coordinates"].apply(lambda c: getattr(c,"longitude",None))
 
@@ -178,7 +195,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         for idx, col in campos_o.items():
             ws_o.cell(row=excel_row, column=idx, value=row[col])
 
-    # Guardar
+    # Guardar archivo
     out_path = DOWNLOAD_DIR / out_name
     wb.save(out_path)
     return out_path
@@ -186,16 +203,16 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 # ────────────────────────────────  Endpoint
 @app.get("/export")
 def export_excel(request: Request, campana_id: str = Query(...)):
-    df_camp = fetch_df("campana",    campana_id)
+    df_camp = fetch_df("campana",     campana_id)
     df_met  = fetch_df("Metodologia", campana_id)
-    df_reg  = fetch_df("Registro",   campana_id)
+    df_reg  = fetch_df("Registro",    campana_id)
 
     if df_camp.empty or df_met.empty or df_reg.empty:
         raise HTTPException(status_code=404, detail="No hay datos para la campaña.")
 
-    fname = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
-    path  = generar_excel(df_camp, df_met, df_reg, fname)
+    filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
+    path     = generar_excel(df_camp, df_met, df_reg, filename)
 
-    url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
-    return JSONResponse({"download_url": url})
+    download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
+    return JSONResponse({"download_url": download_url})
 

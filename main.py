@@ -112,41 +112,79 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 
     # 2. EstacionReplica (datos desde fila 2) --------------------
     df_met = df_met.copy()
-    df_met["Número Réplica"]     = df_met.groupby(["nameest","Type"]).cumcount() + 1
-    df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1)
+    df_reg = df_reg.copy()  # <- asegurar que no tocamos el original
+
+    # ---------- A. Enlazamos coordenadas de df_reg a df_met ----------
+    def extract_lat(c): return getattr(c, "latitude",  None) if pd.notna(c) else None
+    def extract_lon(c): return getattr(c, "longitude", None) if pd.notna(c) else None
+
+    # Tomamos el PRIMER registro por metodologiaID (si hay varios)
+    coord_cols = ["metodologiaID", "startCoordTL", "endCoordTL"]
+    coord_map = (
+        df_reg.loc[df_reg[coord_cols].notna().any(axis=1), coord_cols]
+              .groupby("metodologiaID")
+              .first()
+              .rename(columns={
+                  "startCoordTL": "coord_start",
+                  "endCoordTL":   "coord_end"
+              })
+    )
+
+    # Unimos a df_met por 'id' (en df_met) ↔︎ 'metodologiaID' (en df_reg)
+    df_met = df_met.merge(
+        coord_map, how="left", left_on="id", right_index=True
+    )
+
+    # Extraemos lat/lon
+    df_met["Latitud decimal inicio"]   = df_met["coord_start"].map(extract_lat)
+    df_met["Longitud decimal inicio"]  = df_met["coord_start"].map(extract_lon)
+    df_met["Latitud decimal término"]  = df_met["coord_end"].map(extract_lat)
+    df_met["Longitud decimal término"] = df_met["coord_end"].map(extract_lon)
+
+    # ---------- B. Resto de transformaciones ----------
+    df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
+    df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
     df_met["Tipo de monitoreo"]  = "Transecto"
-    df_met["Latitud decimal inicio"]   = df_met["startCoordTL"].apply(lambda c: getattr(c,"latitude",None))
-    df_met["Longitud decimal inicio"]  = df_met["startCoordTL"].apply(lambda c: getattr(c,"longitude",None))
-    df_met["Latitud decimal término"]   = df_met["endtCoordTL"].apply(lambda c: getattr(c,"latitude",None))
-    df_met["Longitud decimal término"]  = df_met["endCoordTL"].apply(lambda c: getattr(c,"longitude",None))
-  
+
+    # Renombrar a los títulos que exige la plantilla
     df_met = df_met.rename(columns={
-        "nameest":"Nombre estación",
-        "Observaciones":"Descripción EstacionReplica",
-        "Ancho":"Ancho (m)", "Radio":"Radio (m)",
-        "region":"Región","provincia":"Provincia",
-        "comuna":"Comuna","localidad":"Localidad",
+        "nameest":       "Nombre estación",
+        "Observaciones": "Descripción EstacionReplica",
+        "Ancho":         "Ancho (m)",
+        "Radio":         "Radio (m)",
+        "region":        "Región",
+        "provincia":     "Provincia",
+        "comuna":        "Comuna",
+        "localidad":     "Localidad",
     })
 
+    # Diccionario “columna plantilla → índice Excel”
     cols_e = {
-        "ID EstacionReplica":1,"Nombre estación":2,"Tipo de monitoreo":3,"Número Réplica":4,
-        "Descripción EstacionReplica":5,"Largo (m)":6,"Ancho (m)":7,"Radio (m)":8,
-        "Superficie (m2)":9,"Latitud decimal central":10,"Longitud decimal central":11,
-        "Latitud decimal inicio":12,"Longitud decimal inicio":13,
-        "Latitud decimal término":14,"Longitud decimal término":15,
-        "Región":16,"Provincia":17,"Comuna":18,"Localidad":19,
+        "ID EstacionReplica": 1,  "Nombre estación": 2,     "Tipo de monitoreo": 3,
+        "Número Réplica": 4,      "Descripción EstacionReplica": 5,
+        "Largo (m)": 6,           "Ancho (m)": 7,           "Radio (m)": 8,
+        "Superficie (m2)": 9,     "Latitud decimal central": 10,
+        "Longitud decimal central": 11,
+        "Latitud decimal inicio": 12,  "Longitud decimal inicio": 13,
+        "Latitud decimal término": 14, "Longitud decimal término": 15,
+        "Región": 16, "Provincia": 17, "Comuna": 18, "Localidad": 19,
     }
+
+    # Nos aseguramos de que todas las columnas existan
     for c in cols_e:
         if c not in df_met.columns:
-            df_met[c] = ""
+            df_met[c] = np.nan
 
+    # Limpiamos filas previas en la hoja Excel (si las hubiera)
     if ws_e.max_row > 1:
         ws_e.delete_rows(2, ws_e.max_row - 1)
 
-    for i, row in df_met.iterrows():
+    # Escribimos fila por fila
+    for i, fila in df_met.iterrows():
         excel_row = i + 2
-        for col, idx in cols_e.items():
-            ws_e.cell(row=excel_row, column=idx, value=row[col])
+        for col_name, col_idx in cols_e.items():
+            ws_e.cell(row=excel_row, column=col_idx, value=fila[col_name])
+
 
     # 3. Ocurrencia ---------------------------------------------
     df_reg = df_reg.copy()
@@ -220,6 +258,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

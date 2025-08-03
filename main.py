@@ -253,11 +253,25 @@ def export_excel(request: Request, campana_id: str = Query(...)):
     if df_camp.empty or df_met.empty or df_reg.empty:
         raise HTTPException(status_code=404, detail="No hay datos para la campaña.")
 
+    # Bloque limpiador  
+    # ──────────────────────────  Limpiar sentinelas 999999 / "NO DATA"
+    def _to_none(val):
+        """Convierte 999999 (int/float) y 'NO DATA' (str) en None."""
+        if isinstance(val, (int, float)) and val == 999999:
+            return None
+        if isinstance(val, str) and val.strip().upper() == "NO DATA":
+            return None
+        return val
+
+    df_met = df_met.applymap(_to_none)
+    df_reg = df_reg.applymap(_to_none)
+  
     filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
     path     = generar_excel(df_camp, df_met, df_reg, filename)
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

@@ -174,7 +174,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         19:"familia",20:"genero",
         24:"nombreComun",
         26:"estadoOrganismo",
-        28:"parametro",29:"tipoCuantificación",
+        28:"parametro",29:"tipoCuantificacion",
         30:"valor",31:"unidadValor",
         32:"Latitud decimal registro",33:"Longitud decimal registro",
         34:"Hora registro",
@@ -215,4 +215,5 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 

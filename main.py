@@ -115,6 +115,11 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_met["Número Réplica"]     = df_met.groupby(["nameest","Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1)
     df_met["Tipo de monitoreo"]  = "Transecto"
+    df_met["Latitud decimal inicio"]   = df_met["startCoordTL"].apply(lambda c: getattr(c,"latitude",None))
+    df_met["Longitud decimal inicio"]  = df_met["startCoordTL"].apply(lambda c: getattr(c,"longitude",None))
+    df_met["Latitud decimal término"]   = df_met["endtCoordTL"].apply(lambda c: getattr(c,"latitude",None))
+    df_met["Longitud decimal término"]  = df_met["endCoordTL"].apply(lambda c: getattr(c,"longitude",None))
+  
     df_met = df_met.rename(columns={
         "nameest":"Nombre estación",
         "Observaciones":"Descripción EstacionReplica",
@@ -215,5 +220,6 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 

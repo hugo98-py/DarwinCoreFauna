@@ -20,6 +20,7 @@ import os, re, base64, json, uuid, warnings
 from pathlib import Path
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -65,9 +66,13 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="download
 # ────────────────────────────────  Utilidades
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
-
-def clean_dt(x: Any) -> Any:
-    return x.replace(tzinfo=None) if isinstance(x, datetime) and x.tzinfo else x
+LOCAL_TZ = ZoneInfo("America/Santiago")
+def clean_dt(x):
+    if isinstance(x, datetime):
+        if x.tzinfo is not None:
+            x = x.astimezone(LOCAL_TZ)   # ← conversión clave
+        return x.replace(tzinfo=None)    # ← ahora sí, sin perder la hora real
+    return x
 
 def fetch_df(collection: str, campana_id: str) -> pd.DataFrame:
     campana_id = campana_id.strip('"')
@@ -271,6 +276,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

@@ -132,7 +132,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 
     # Unimos a df_met por 'id' (en df_met) ↔︎ 'metodologiaID' (en df_reg)
     df_met = df_met.merge(
-        coord_map, how="left", left_on="id", right_index=True
+        coord_map, how="left", left_on="metodologiaID", right_index=True
     )
 
     # Extraemos lat/lon
@@ -271,6 +271,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

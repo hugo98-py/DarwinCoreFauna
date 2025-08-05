@@ -116,36 +116,16 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         ws_c.cell(row=3, column=col, value=val)
 
     # 2. EstacionReplica (datos desde fila 2) --------------------
-    df_met = df_met.copy()
-    df_reg = df_reg.copy()  # <- asegurar que no tocamos el original
+    df_met = df_met.copy()   # ← copiamos solo df_met; df_reg no se toca aquí
 
-    # ---------- A. Enlazamos coordenadas de df_reg a df_met ----------
     def extract_lat(c): return getattr(c, "latitude",  None) if pd.notna(c) else None
     def extract_lon(c): return getattr(c, "longitude", None) if pd.notna(c) else None
 
-    # Tomamos el PRIMER registro por metodologiaID (si hay varios)
-    coord_cols = ["metodologiaID", "startCoordTL", "endCoordTL"]
-    coord_map = (
-        df_reg.loc[df_reg[coord_cols].notna().any(axis=1), coord_cols]
-              .groupby("metodologiaID")
-              .first()
-              .rename(columns={
-                  "startCoordTL": "coord_start",
-                  "endCoordTL":   "coord_end"
-              })
-    )
-
-    # Unimos a df_met por 'id' (en df_met) ↔︎ 'metodologiaID' (en df_reg)
-    df_met = df_met.merge(
-        coord_map, how="left", left_on="metodologiaID", right_index=True
-    )
-
-    # Extraemos lat/lon
-    df_met["Latitud decimal inicio"]   = df_met["coord_start"].map(extract_lat)
-    df_met["Longitud decimal inicio"]  = df_met["coord_start"].map(extract_lon)
-    df_met["Latitud decimal término"]  = df_met["coord_end"].map(extract_lat)
-    df_met["Longitud decimal término"] = df_met["coord_end"].map(extract_lon)
-
+    df_met["Latitud decimal inicio"]   = df_met["startCoordTL"].map(extract_lat)
+    df_met["Longitud decimal inicio"]  = df_met["startCoordTL"].map(extract_lon)
+    df_met["Latitud decimal término"]  = df_met["endCoordTL"].map(extract_lat)
+    df_met["Longitud decimal término"] = df_met["endCoordTL"].map(extract_lon)
+  
     # ---------- B. Resto de transformaciones ----------
     df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
@@ -276,6 +256,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

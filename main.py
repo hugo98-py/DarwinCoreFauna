@@ -195,17 +195,22 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     # FILTRO: ignorar registros de ciertos tipos en la hoja Ocurrencia
     # ────────────────────────────────────────────────────────────────
     EXCLUDE_TYPES = {
-        "Detección de Ecolocalizaciones",
+        "Detección de Eco Localizaciones",   # ← nombre correcto
         "Trampas Sherman",
         "Trampas Cámara",
     }
     
-    # Necesitamos conocer el 'Type' de cada registro ↓
+    # Mapeamos metodologiaID ➜ Type
     tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
     df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
     
-    # Filtramos: solo los que NO estén en la lista
-    df_reg = df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)].copy()
+    # Quitamos los tipos excluidos y RESETEAMOS el índice
+    df_reg = (
+        df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)]
+        .copy()
+        .reset_index(drop=True)    # ← evita huecos al escribir en Excel
+    )
+    
     # (opcional) ya no necesitamos la columna auxiliar
     df_reg.drop(columns=["Type"], inplace=True)
   
@@ -287,6 +292,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

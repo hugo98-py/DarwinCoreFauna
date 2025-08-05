@@ -116,11 +116,16 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         ws_c.cell(row=3, column=col, value=val)
 
     # 2. EstacionReplica (datos desde fila 2) --------------------
-    df_met = df_met.copy()   # ← copiamos solo df_met; df_reg no se toca aquí
+    df_met = df_met.copy()
 
-    def extract_lat(c): return getattr(c, "latitude",  None) if pd.notna(c) else None
-    def extract_lon(c): return getattr(c, "longitude", None) if pd.notna(c) else None
-
+    # Asegura que las columnas existan SIEMPRE
+    for col in ["startCoordTL", "endCoordTL"]:
+        if col not in df_met.columns:
+            df_met[col] = None        # crea columna con NaN (para evitar KeyError)
+    
+    def extract_lat(p): return getattr(p, "latitude",  None) if pd.notna(p) else None
+    def extract_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
+    
     df_met["Latitud decimal inicio"]   = df_met["startCoordTL"].map(extract_lat)
     df_met["Longitud decimal inicio"]  = df_met["startCoordTL"].map(extract_lon)
     df_met["Latitud decimal término"]  = df_met["endCoordTL"].map(extract_lat)
@@ -264,6 +269,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

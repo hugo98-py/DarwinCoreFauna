@@ -129,7 +129,15 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     # ---------- B. Resto de transformaciones ----------
     df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
-    df_met["Tipo de monitoreo"]  = "Transecto"
+    
+    def build_tipo_mon(row):
+        if row["Type"] in ("Transecto Lineal", "Play Back"):
+            return f"{row['Type']} - {row['Clase']}"
+        else:
+            return row["Type"]
+
+    df_met["Tipo de monitoreo"] = df_met.apply(build_tipo_mon, axis=1)
+  
 
     # Renombrar a los títulos que exige la plantilla
     df_met = df_met.rename(columns={
@@ -256,6 +264,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

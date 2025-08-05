@@ -190,7 +190,25 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 
     id_map = dict(zip(df_met.get("metodologiaID", []), df_met["ID EstacionReplica"]))
     df_reg["ID EstacionReplica"] = df_reg.get("metodologiaID").map(id_map)
-
+  
+    # ────────────────────────────────────────────────────────────────
+    # FILTRO: ignorar registros de ciertos tipos en la hoja Ocurrencia
+    # ────────────────────────────────────────────────────────────────
+    EXCLUDE_TYPES = {
+        "Detección de Ecolocalizaciones",
+        "Trampas Sherman",
+        "Trampas Cámara",
+    }
+    
+    # Necesitamos conocer el 'Type' de cada registro ↓
+    tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
+    df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
+    
+    # Filtramos: solo los que NO estén en la lista
+    df_reg = df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)].copy()
+    # (opcional) ya no necesitamos la columna auxiliar
+    df_reg.drop(columns=["Type"], inplace=True)
+  
     df_reg["Año del evento"]             = df_reg["Time"].dt.year
     df_reg["Mes del evento"]             = df_reg["Time"].dt.month
     df_reg["Día del evento"]             = df_reg["Time"].dt.day
@@ -269,6 +287,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

@@ -21,7 +21,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
-
+import math
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Query, Request, HTTPException
@@ -138,6 +138,10 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     mask_otras = ~mask_tl
     df_met.loc[mask_otras, "Latitud decimal central"]  = df_met["centralCoordinate"].map(get_lat)
     df_met.loc[mask_otras, "Longitud decimal central"] = df_met["centralCoordinate"].map(get_lon)
+  
+    # Superficie solo para mets que contienen el campo "Radio"
+    mask_pm = df_met["Type"] == "Punto de Muestreo"
+    df_met.loc[mask_pm, "Superficie (m2)"] =  math.pi * df_met["Radio"]**2
 
   
     # ---------- B. Resto de transformaciones ----------
@@ -304,6 +308,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

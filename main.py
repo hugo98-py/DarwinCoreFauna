@@ -141,7 +141,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
   
     # Superficie solo para mets que contienen el campo "Radio"
     mask_pm = df_met["Type"] == "Punto de Muestreo"
-    df_met.loc[mask_pm, "Superficie (m2)"] =  math.pi * df_met["Radio"]**2
+    df_met.loc[mask_pm, "Superficie (m2)"] =  np.round((math.pi * df_met["Radio"]**2),0)
 
   
     # ---------- B. Resto de transformaciones ----------
@@ -308,6 +308,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

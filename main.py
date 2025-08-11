@@ -237,7 +237,8 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_reg["Nombre campaña"]   = camp["Name"]
     df_reg["Muestreado por"]   = "AMS Consultores"
     df_reg["Identificado por"] = "AMS Consultores"
-
+    df_reg["Epíteto específico"] = df_reg["epiteto"]
+  
     campos_o = {
         1:"ID Campaña",2:"Nombre campaña",3:"ID EstacionReplica",
         5:"Año del evento",6:"Mes del evento",7:"Día del evento",
@@ -247,7 +248,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         14:"comentario",
         15:"reino",16:"division",17:"clase",18:"orden",
         19:"familia",20:"genero",
-        24:"nombreComun",
+        22: "epiteto",24:"nombreComun",
         26:"estadoOrganismo",
         28:"parametro",29:"tipoCuantificacion",
         30:"valor",31:"unidadValor",
@@ -303,6 +304,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

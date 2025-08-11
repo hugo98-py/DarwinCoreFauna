@@ -143,7 +143,8 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     # ---------- B. Resto de transformaciones ----------
     df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
-    
+    df_met["Ecosistema nivel 2"] = df_met["ambienteest"]
+  
     def build_tipo_mon(row):
         if row["Type"] in ("Transecto Lineal", "Play Back"):
             return f"{row['Type']} - {row['Clase']}"
@@ -175,6 +176,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         "Latitud decimal inicio": 12,  "Longitud decimal inicio": 13,
         "Latitud decimal término": 14, "Longitud decimal término": 15,
         "Región": 16, "Provincia": 17, "Comuna": 18, "Localidad": 19,
+        "Ecosistema nivel 2": 21,
     }
 
     # Nos aseguramos de que todas las columnas existan
@@ -301,6 +303,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

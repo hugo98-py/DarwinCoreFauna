@@ -118,18 +118,27 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     # 2. EstacionReplica (datos desde fila 2) --------------------
     df_met = df_met.copy()
 
-    # Asegura que las columnas existan SIEMPRE
-    for col in ["startCoordTL", "endCoordTL"]:
+    # Asegura columnas necesarias
+    for col in ["startCoordTL", "endCoordTL", "centralCoordinates", "type"]:
         if col not in df_met.columns:
-            df_met[col] = None        # crea columna con NaN (para evitar KeyError)
+            df_met[col] = None
     
-    def extract_lat(p): return getattr(p, "latitude",  None) if pd.notna(p) else None
-    def extract_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
+    # Función simple para extraer lat/lon
+    def get_lat(p): return getattr(p, "latitude", None) if pd.notna(p) else None
+    def get_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
     
-    df_met["Latitud decimal inicio"]   = df_met["startCoordTL"].map(extract_lat)
-    df_met["Longitud decimal inicio"]  = df_met["startCoordTL"].map(extract_lon)
-    df_met["Latitud decimal término"]  = df_met["endCoordTL"].map(extract_lat)
-    df_met["Longitud decimal término"] = df_met["endCoordTL"].map(extract_lon)
+    # Transecto Lineal → inicio y término
+    mask_tl = df_met["type"] == "Transecto Lineal"
+    df_met.loc[mask_tl, "Latitud decimal inicio"]   = df_met["startCoordTL"].map(get_lat)
+    df_met.loc[mask_tl, "Longitud decimal inicio"]  = df_met["startCoordTL"].map(get_lon)
+    df_met.loc[mask_tl, "Latitud decimal término"]  = df_met["endCoordTL"].map(get_lat)
+    df_met.loc[mask_tl, "Longitud decimal término"] = df_met["endCoordTL"].map(get_lon)
+    
+    # Otras metodologías → coordenada central
+    mask_otras = ~mask_tl
+    df_met.loc[mask_otras, "Latitud decimal central"]  = df_met["centralCoordinates"].map(get_lat)
+    df_met.loc[mask_otras, "Longitud decimal central"] = df_met["centralCoordinates"].map(get_lon)
+
   
     # ---------- B. Resto de transformaciones ----------
     df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
@@ -292,6 +301,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

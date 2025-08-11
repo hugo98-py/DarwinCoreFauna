@@ -119,7 +119,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_met = df_met.copy()
 
     # Asegura columnas necesarias
-    for col in ["startCoordTL", "endCoordTL", "centralCoordinate", "type"]:
+    for col in ["startCoordTL", "endCoordTL", "centralCoordinate", "Type"]:
         if col not in df_met.columns:
             df_met[col] = None
     
@@ -128,7 +128,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     def get_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
     
     # Transecto Lineal → inicio y término
-    mask_tl = df_met["type"] == "Transecto Lineal"
+    mask_tl = df_met["Type"] == "Transecto Lineal"
     df_met.loc[mask_tl, "Latitud decimal inicio"]   = df_met["startCoordTL"].map(get_lat)
     df_met.loc[mask_tl, "Longitud decimal inicio"]  = df_met["startCoordTL"].map(get_lon)
     df_met.loc[mask_tl, "Latitud decimal término"]  = df_met["endCoordTL"].map(get_lat)
@@ -301,6 +301,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

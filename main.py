@@ -21,14 +21,17 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
-import math
+
 import numpy as np
 import pandas as pd
+
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware  # ← NEW
+from fastapi.middleware.cors import CORSMiddleware
+
 from openpyxl import load_workbook
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -66,12 +69,14 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="download
 # ────────────────────────────────  Utilidades
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
+
 LOCAL_TZ = ZoneInfo("America/Santiago")
+
 def clean_dt(x):
     if isinstance(x, datetime):
         if x.tzinfo is not None:
-            x = x.astimezone(LOCAL_TZ)   # ← conversión clave
-        return x.replace(tzinfo=None)    # ← ahora sí, sin perder la hora real
+            x = x.astimezone(LOCAL_TZ)   # conserva la hora real local
+        return x.replace(tzinfo=None)
     return x
 
 def fetch_df(collection: str, campana_id: str) -> pd.DataFrame:
@@ -96,6 +101,42 @@ def ymd(dt: Any):
     except Exception:
         return None, None, None
 
+# ───────── Helpers de saneo numérico (soporta comas decimales) ─────────
+def _to_none(val):
+    """Convierte 999999 (int/float) y 'NO DATA' (str) en None."""
+    if isinstance(val, (int, float)) and val == 999999:
+        return None
+    if isinstance(val, str) and val.strip().upper() == "NO DATA":
+        return None
+    return val
+
+def _to_num(v):
+    """Convierte strings con coma decimal/miles a float; valores raros → NaN."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return np.nan
+    if isinstance(v, (int, float, np.number)):
+        return float(v)
+    s = str(v).strip()
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return np.nan
+    # Si tiene comas y no puntos, interpretamos coma como decimal
+    if s.count(",") >= 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    # Caso 1.234.567,89 → elimina separadores de miles
+    if s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+def _coerce_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].map(_to_num)
+    return df
+
 # ────────────────────────────────  Generar Excel
 def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     wb   = load_workbook(TEMPLATE_PATH)
@@ -111,7 +152,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     y_t,m_t,d_t = ymd(camp["endDateCamp"])
 
     for col,val in enumerate(
-        [1, camp["Name"], camp["ncampana"], y_i,m_i,d_i, y_t,m_t,d_t], 1
+        [1, camp.get("Name"), camp.get("ncampana"), y_i,m_i,d_i, y_t,m_t,d_t], 1
     ):
         ws_c.cell(row=3, column=col, value=val)
 
@@ -122,41 +163,48 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     for col in ["startCoordTL", "endCoordTL", "centralCoordinate", "Type"]:
         if col not in df_met.columns:
             df_met[col] = None
-    
+
     # Función simple para extraer lat/lon
     def get_lat(p): return getattr(p, "latitude", None) if pd.notna(p) else None
     def get_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
-    
+
     # Transecto Lineal → inicio y término
     mask_tl = df_met["Type"] == "Transecto Lineal"
     df_met.loc[mask_tl, "Latitud decimal inicio"]   = df_met["startCoordTL"].map(get_lat)
     df_met.loc[mask_tl, "Longitud decimal inicio"]  = df_met["startCoordTL"].map(get_lon)
     df_met.loc[mask_tl, "Latitud decimal término"]  = df_met["endCoordTL"].map(get_lat)
     df_met.loc[mask_tl, "Longitud decimal término"] = df_met["endCoordTL"].map(get_lon)
-    
+
     # Otras metodologías → coordenada central
     mask_otras = ~mask_tl
     df_met.loc[mask_otras, "Latitud decimal central"]  = df_met["centralCoordinate"].map(get_lat)
     df_met.loc[mask_otras, "Longitud decimal central"] = df_met["centralCoordinate"].map(get_lon)
-  
-    # Superficie solo para mets que contienen el campo "Radio"
-    mask_pm = df_met["Type"] == "Punto de Muestreo"
-    df_met.loc[mask_pm, "Superficie (m2)"] =  np.round((math.pi * df_met["Radio"]**2),0)
 
-  
+    # -------- LIMPIEZA NUMÉRICA Y SUPERFICIE (💥 fix del 500) --------
+    # Coerciona columnas numéricas relevantes (ajusta si usas otras)
+    df_met = _coerce_numeric_cols(
+        df_met,
+        ["Radio", "Ancho", "Largo", "Ancho M", "Largo M"]
+    )
+
+    # Superficie solo para 'Punto de Muestreo' con Radio válido
+    mask_pm  = (df_met["Type"] == "Punto de Muestreo")
+    radios   = pd.to_numeric(df_met["Radio"], errors="coerce")
+    area_pm  = (np.pi * radios.pow(2)).round(0)
+    df_met.loc[mask_pm, "Superficie (m2)"] = area_pm
+
     # ---------- B. Resto de transformaciones ----------
     df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
     df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
     df_met["Ecosistema nivel 2"] = df_met["ambienteest"]
-  
+
     def build_tipo_mon(row):
         if row["Type"] in ("Transecto Lineal", "Play Back"):
-            return f"{row['Type']} - {row['Clase']}"
+            return f"{row['Type']} - {row.get('Clase')}"
         else:
             return row["Type"]
 
     df_met["Tipo de monitoreo"] = df_met.apply(build_tipo_mon, axis=1)
-  
 
     # Renombrar a los títulos que exige la plantilla
     df_met = df_met.rename(columns={
@@ -192,43 +240,36 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     if ws_e.max_row > 1:
         ws_e.delete_rows(2, ws_e.max_row - 1)
 
-    # Escribimos fila por fila
-    for i, fila in df_met.iterrows():
-        excel_row = i + 2
+    # Escribimos fila por fila (índice limpio para no saltar filas)
+    for excel_row, (_, fila) in enumerate(df_met.reset_index(drop=True).iterrows(), start=2):
         for col_name, col_idx in cols_e.items():
             ws_e.cell(row=excel_row, column=col_idx, value=fila[col_name])
-
 
     # 3. Ocurrencia ---------------------------------------------
     df_reg = df_reg.copy()
     df_reg["Time"] = pd.to_datetime(df_reg["Time"], errors="coerce")
 
     id_map = dict(zip(df_met.get("metodologiaID", []), df_met["ID EstacionReplica"]))
-    df_reg["ID EstacionReplica"] = df_reg.get("metodologiaID").map(id_map)
-  
-    # ────────────────────────────────────────────────────────────────
-    # FILTRO: ignorar registros de ciertos tipos en la hoja Ocurrencia
-    # ────────────────────────────────────────────────────────────────
+    if "metodologiaID" in df_reg.columns:
+        df_reg["ID EstacionReplica"] = df_reg["metodologiaID"].map(id_map)
+    else:
+        df_reg["ID EstacionReplica"] = np.nan
+
+    # Excluir tipos de la hoja Ocurrencia
     EXCLUDE_TYPES = {
         "Detección de Eco Localizaciones",   # ← nombre correcto
         "Trampas Sherman",
         "Trampas Cámara",
     }
-    
-    # Mapeamos metodologiaID ➜ Type
-    tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
-    df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
-    
-    # Quitamos los tipos excluidos y RESETEAMOS el índice
-    df_reg = (
-        df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)]
-        .copy()
-        .reset_index(drop=True)    # ← evita huecos al escribir en Excel
-    )
-    
-    # (opcional) ya no necesitamos la columna auxiliar
-    df_reg.drop(columns=["Type"], inplace=True)
-  
+
+    # Mapeamos metodologiaID ➜ Type (si existe)
+    if "metodologiaID" in df_met.columns and "metodologiaID" in df_reg.columns:
+        tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
+        df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
+        df_reg = df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)].copy()
+        df_reg.drop(columns=["Type"], inplace=True, errors="ignore")
+        df_reg.reset_index(drop=True, inplace=True)
+
     df_reg["Año del evento"]             = df_reg["Time"].dt.year
     df_reg["Mes del evento"]             = df_reg["Time"].dt.month
     df_reg["Día del evento"]             = df_reg["Time"].dt.day
@@ -237,12 +278,12 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_reg["Latitud decimal registro"]   = df_reg["Coordinates"].apply(lambda c: getattr(c,"latitude",None))
     df_reg["Longitud decimal registro"]  = df_reg["Coordinates"].apply(lambda c: getattr(c,"longitude",None))
 
-    df_reg["ID Campaña"]       = 1
-    df_reg["Nombre campaña"]   = camp["Name"]
-    df_reg["Muestreado por"]   = "AMS Consultores"
-    df_reg["Identificado por"] = "AMS Consultores"
-    df_reg["Epíteto específico"] = df_reg["epiteto"]
-  
+    df_reg["ID Campaña"]         = 1
+    df_reg["Nombre campaña"]     = camp.get("Name")
+    df_reg["Muestreado por"]     = "AMS Consultores"
+    df_reg["Identificado por"]   = "AMS Consultores"
+    df_reg["Epíteto específico"] = df_reg.get("epiteto")
+
     campos_o = {
         1:"ID Campaña",2:"Nombre campaña",3:"ID EstacionReplica",
         5:"Año del evento",6:"Mes del evento",7:"Día del evento",
@@ -252,7 +293,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         14:"comentario",
         15:"reino",16:"division",17:"clase",18:"orden",
         19:"familia",20:"genero",
-        22: "epiteto",24:"nombreComun",
+        22:"epiteto",24:"nombreComun",
         26:"estadoOrganismo",
         28:"parametro",29:"tipoCuantificacion",
         30:"valor",31:"unidadValor",
@@ -270,8 +311,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     if ws_o.max_row > 2:
         ws_o.delete_rows(3, ws_o.max_row - 2)
 
-    for i, row in df_reg.iterrows():
-        excel_row = i + 3
+    for excel_row, (_, row) in enumerate(df_reg.reset_index(drop=True).iterrows(), start=3):
         for idx, col in campos_o.items():
             ws_o.cell(row=excel_row, column=idx, value=row[col])
 
@@ -290,32 +330,15 @@ def export_excel(request: Request, campana_id: str = Query(...)):
     if df_camp.empty or df_met.empty or df_reg.empty:
         raise HTTPException(status_code=404, detail="No hay datos para la campaña.")
 
-    # Bloque limpiador  
-    # ──────────────────────────  Limpiar sentinelas 999999 / "NO DATA"
-    def _to_none(val):
-        """Convierte 999999 (int/float) y 'NO DATA' (str) en None."""
-        if isinstance(val, (int, float)) and val == 999999:
-            return None
-        if isinstance(val, str) and val.strip().upper() == "NO DATA":
-            return None
-        return val
+    # Bloque limpiador (sin applymap deprecado)
+    df_met = df_met.apply(lambda col: col.map(_to_none))
+    df_reg = df_reg.apply(lambda col: col.map(_to_none))
 
-    df_met = df_met.applymap(_to_none)
-    df_reg = df_reg.applymap(_to_none)
-  
     filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
     path     = generar_excel(df_camp, df_met, df_reg, filename)
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
-
-
-
-
-
-
-
-
 
 
 

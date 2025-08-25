@@ -263,12 +263,43 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     }
 
     # Mapeamos metodologiaID ➜ Type (si existe)
+    # ───────────── Propiedades dinámicas: 'Tránsito Aereo' ─────────────
     if "metodologiaID" in df_met.columns and "metodologiaID" in df_reg.columns:
         tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
         df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
+
+        # Construye Propiedades dinámicas solo para 'Tránsito Aereo'
+        def _build_dyn(row):
+            if row.get("Type") != "Tránsito Aéreo":
+                return ""
+            d = row.get("desdeEl")
+            h = row.get("haciaEl")
+            a = row.get("altura")
+            t = row.get("tipoVuelo")
+
+            parts = []
+            if pd.notna(d) and str(d).strip() != "":
+                parts.append(f"Desde = {d}")
+            if pd.notna(h) and str(h).strip() != "":
+                parts.append(f"Hacia = {h}")
+            if pd.notna(a) and str(a).strip() != "":
+                parts.append(f"Altura de vuelo (m) = {a}")
+            if pd.notna(t) and str(t).strip() != "":
+                parts.append(f"Tipo de vuelo = {t}")
+            return "; ".join(parts)
+
+        df_reg["Propiedades dinámicas"] = df_reg.apply(_build_dyn, axis=1)
+
+        # Excluir metodologías no consideradas en Ocurrencia
+        EXCLUDE_TYPES = {
+            "Detección de Eco Localizaciones",
+            "Trampas Sherman",
+            "Trampas Cámara",
+        }
         df_reg = df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)].copy()
         df_reg.drop(columns=["Type"], inplace=True, errors="ignore")
         df_reg.reset_index(drop=True, inplace=True)
+
 
     df_reg["Año del evento"]             = df_reg["Time"].dt.year
     df_reg["Mes del evento"]             = df_reg["Time"].dt.month
@@ -301,6 +332,7 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         34:"Hora registro",
         35:"condicionReproductiva",
         36:"sexo",37:"etapaVida",
+        40:"Propiedades dinámicas",
         41:"tipoRegistro",
         44:"Muestreado por",45:"Identificado por",
     }
@@ -339,6 +371,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

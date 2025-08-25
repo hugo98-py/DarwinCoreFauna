@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI · Exportador Excel DwC-SMA (Render-ready)
-------------------------------------------------
-• Rellena la plantilla oficial DwC-SMA (.xlsx) con datos de Firestore.
-• Mantiene 100 % el formato (openpyxl+lxml, edición celda-por-celda).
-• Endpoint único:   /export?campana_id=…   →  {"download_url": "..."}
-• Descargas servidas desde  /downloads/<archivo.xlsx>
+FastAPI · Exportador Excel DwC-SMA (versión escritura con pandas)
+-----------------------------------------------------------------
+• Llena la plantilla oficial DwC-SMA (.xlsx) usando pandas.ExcelWriter.
+• Hoja 'Campaña' se completa con overlay (respeta la estructura general).
+• Hojas 'EstacionReplica' y 'Ocurrencia' se REEMPLAZAN (if_sheet_exists='replace').
 
-Claves de producción:
-  ▸ FIREBASE_KEY_B64   – variable de entorno con el JSON de la service-account
-                         codificado en base-64 (una sola línea).
-  ▸ Plantilla .xlsx     – debe residir junto a este archivo en el repo.
-  ▸ Render Free plan    – ficheros de salida se guardan en /tmp.
+Endpoint único:
+  /export?campana_id=…   →  {"download_url": "..."}
 
-Nuevo: middleware CORS para que peticiones desde navegadores no fallen.
+Requisitos:
+  pip install fastapi uvicorn pandas openpyxl google-cloud-firestore firebase-admin numpy
 """
 
-import os, re, base64, json, uuid, warnings
+import os, re, base64, json, uuid, warnings, shutil, unicodedata
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -30,8 +27,6 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from openpyxl import load_workbook
-
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -42,6 +37,8 @@ ROOT_DIR      = Path(__file__).parent
 TEMPLATE_PATH = ROOT_DIR / "FormatoBiodiversidadMonitoreoYLineaBase_v5.2.xlsx"
 DOWNLOAD_DIR  = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+LOCAL_TZ = ZoneInfo("America/Santiago")
 
 # ────────────────────────────────  Firebase Init
 B64 = os.environ.get("FIREBASE_KEY_B64")
@@ -54,41 +51,37 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ────────────────────────────────  FastAPI + CORS
-app = FastAPI(title="Exporter DwC-SMA")
+app = FastAPI(title="Exporter DwC-SMA (pandas)")
 
-# ➜ MIDDLEWARE CORS (abierto a cualquier origen; ajusta si quieres)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # poner tu dominio en producción
+    allow_origins=["*"],      # ajusta en prod
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
 
-# ────────────────────────────────  Utilidades
+# ────────────────────────────────  Utils
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-]+", "-", s)
-
-LOCAL_TZ = ZoneInfo("America/Santiago")
 
 def clean_dt(x):
     if isinstance(x, datetime):
         if x.tzinfo is not None:
-            x = x.astimezone(LOCAL_TZ)   # conserva la hora real local
+            x = x.astimezone(LOCAL_TZ)
         return x.replace(tzinfo=None)
     return x
 
 def fetch_df(collection: str, campana_id: str) -> pd.DataFrame:
-    campana_id = campana_id.strip('"')
-    ref        = db.collection(collection)
-    docs       = list(ref.limit(1).stream())
+    cid = campana_id.strip('"')
+    ref = db.collection(collection)
+    docs = list(ref.limit(1).stream())
     if not docs:
         return pd.DataFrame()
 
-    # Si el documento tiene campanaID, filtramos
     if "campanaID" in docs[0].to_dict():
-        ref = ref.where("campanaID", "==", campana_id)
+        ref = ref.where("campanaID", "==", cid)
 
     data = [{**d.to_dict(), "id": d.id} for d in ref.stream()]
     return pd.DataFrame(data).map(clean_dt)
@@ -101,9 +94,7 @@ def ymd(dt: Any):
     except Exception:
         return None, None, None
 
-# ───────── Helpers de saneo numérico (soporta comas decimales) ─────────
 def _to_none(val):
-    """Convierte 999999 (int/float) y 'NO DATA' (str) en None."""
     if isinstance(val, (int, float)) and val == 999999:
         return None
     if isinstance(val, str) and val.strip().upper() == "NO DATA":
@@ -111,7 +102,6 @@ def _to_none(val):
     return val
 
 def _to_num(v):
-    """Convierte strings con coma decimal/miles a float; valores raros → NaN."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return np.nan
     if isinstance(v, (int, float, np.number)):
@@ -119,10 +109,8 @@ def _to_num(v):
     s = str(v).strip()
     if s == "" or s.lower() in {"nan", "none", "null"}:
         return np.nan
-    # Si tiene comas y no puntos, interpretamos coma como decimal
     if s.count(",") >= 1 and s.count(".") == 0:
         s = s.replace(",", ".")
-    # Caso 1.234.567,89 → elimina separadores de miles
     if s.count(".") > 1:
         parts = s.split(".")
         s = "".join(parts[:-1]) + "." + parts[-1]
@@ -137,78 +125,96 @@ def _coerce_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
             df[c] = df[c].map(_to_num)
     return df
 
-# ────────────────────────────────  Generar Excel
-def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
-    wb   = load_workbook(TEMPLATE_PATH)
-    ws_c = wb["Campaña"]
-    ws_e = wb["EstacionReplica"]
-    ws_o = wb["Ocurrencia"]
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    # 1. Campaña -------------------------------------------------
+def get_col(df: pd.DataFrame, *candidatas: str) -> str | None:
+    norm_map = {_norm(c): c for c in df.columns}
+    for cand in candidatas:
+        key = _norm(cand)
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
+# ────────────────────────────────  Generación Excel con pandas
+def generar_excel_pandas(df_camp, df_met, df_reg, out_name: str) -> Path:
+    # Copiamos la plantilla al destino
+    out_path = DOWNLOAD_DIR / out_name
+    shutil.copyfile(TEMPLATE_PATH, out_path)
+
+    # ========== 1) CAMPANA (overlay en fila 3, col A) ==========
     camp = df_camp.iloc[0].copy()
-    camp["startDateCamp"] = pd.to_datetime(camp["startDateCamp"], errors="coerce")
-    camp["endDateCamp"]   = pd.to_datetime(camp["endDateCamp"],   errors="coerce")
-    y_i,m_i,d_i = ymd(camp["startDateCamp"])
-    y_t,m_t,d_t = ymd(camp["endDateCamp"])
+    camp["startDateCamp"] = pd.to_datetime(camp.get("startDateCamp"), errors="coerce")
+    camp["endDateCamp"]   = pd.to_datetime(camp.get("endDateCamp"),   errors="coerce")
+    y_i, m_i, d_i = ymd(camp.get("startDateCamp"))
+    y_t, m_t, d_t = ymd(camp.get("endDateCamp"))
 
-    for col,val in enumerate(
-        [1, camp.get("Name"), camp.get("ncampana"), y_i,m_i,d_i, y_t,m_t,d_t], 1
-    ):
-        ws_c.cell(row=3, column=col, value=val)
+    # Construimos una fila tal como llenabas antes
+    fila_camp = pd.DataFrame([[
+        1,                                      # ID Campaña (si aplica)
+        camp.get("Name"),                       # Nombre campaña
+        camp.get("ncampana"),                   # Código/num campaña
+        y_i, m_i, d_i,                          # fecha inicio (Y M D)
+        y_t, m_t, d_t,                          # fecha término (Y M D)
+    ]])
 
-    # 2. EstacionReplica (datos desde fila 2) --------------------
-    df_met = df_met.copy()
+    # Escribimos sobre la hoja 'Campaña' en la fila 3 (startrow=2), col A (startcol=0)
+    with pd.ExcelWriter(out_path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as xw:
+        fila_camp.to_excel(
+            xw, sheet_name="Campaña", index=False, header=False, startrow=2, startcol=0
+        )
 
-    # Asegura columnas necesarias
+    # ========== 2) ESTACIONREPLICA (reemplazo completo) ==========
+    dfm = df_met.copy()
+
+    # Asegura columnas mínimas
     for col in ["startCoordTL", "endCoordTL", "centralCoordinate", "Type"]:
-        if col not in df_met.columns:
-            df_met[col] = None
+        if col not in dfm.columns:
+            dfm[col] = None
 
-    # Función simple para extraer lat/lon
+    # helpers de coordenadas
     def get_lat(p): return getattr(p, "latitude", None) if pd.notna(p) else None
     def get_lon(p): return getattr(p, "longitude", None) if pd.notna(p) else None
 
-    # Transecto Lineal → inicio y término
-    mask_tl = df_met["Type"] == "Transecto Lineal"
-    df_met.loc[mask_tl, "Latitud decimal inicio"]   = df_met["startCoordTL"].map(get_lat)
-    df_met.loc[mask_tl, "Longitud decimal inicio"]  = df_met["startCoordTL"].map(get_lon)
-    df_met.loc[mask_tl, "Latitud decimal término"]  = df_met["endCoordTL"].map(get_lat)
-    df_met.loc[mask_tl, "Longitud decimal término"] = df_met["endCoordTL"].map(get_lon)
-    df_met.loc[mask_tl, "Largo (m)"] = df_met.loc[mask_tl, "largo"]
-  
+    mask_tl = dfm["Type"] == "Transecto Lineal"
+    dfm.loc[mask_tl, "Latitud decimal inicio"]   = dfm["startCoordTL"].map(get_lat)
+    dfm.loc[mask_tl, "Longitud decimal inicio"]  = dfm["startCoordTL"].map(get_lon)
+    dfm.loc[mask_tl, "Latitud decimal término"]  = dfm["endCoordTL"].map(get_lat)
+    dfm.loc[mask_tl, "Longitud decimal término"] = dfm["endCoordTL"].map(get_lon)
+
+    # LARGO (m): tolerante a nombres alternativos
+    col_largo = get_col(dfm, "largo", "largo (m)", "largo_m", "length", "length (m)")
+    if col_largo:
+        dfm.loc[mask_tl, "Largo (m)"] = dfm.loc[mask_tl, col_largo]
+
     # Otras metodologías → coordenada central
     mask_otras = ~mask_tl
-    df_met.loc[mask_otras, "Latitud decimal central"]  = df_met["centralCoordinate"].map(get_lat)
-    df_met.loc[mask_otras, "Longitud decimal central"] = df_met["centralCoordinate"].map(get_lon)
+    dfm.loc[mask_otras, "Latitud decimal central"]  = dfm["centralCoordinate"].map(get_lat)
+    dfm.loc[mask_otras, "Longitud decimal central"] = dfm["centralCoordinate"].map(get_lon)
 
-    # -------- LIMPIEZA NUMÉRICA Y SUPERFICIE (💥 fix del 500) --------
-    # Coerciona columnas numéricas relevantes (ajusta si usas otras)
-    df_met = _coerce_numeric_cols(
-        df_met,
-        ["Radio", "Ancho", "Largo", "Ancho M", "Largo M"]
-    )
+    # Numerics & área
+    dfm = _coerce_numeric_cols(dfm, ["Radio", "Ancho", "Largo", "Ancho M", "Largo M"])
+    mask_pm = (dfm["Type"] == "Punto de Muestreo")
+    radios  = pd.to_numeric(dfm.get("Radio"), errors="coerce")
+    dfm.loc[mask_pm, "Superficie (m2)"] = (np.pi * radios.pow(2)).round(0)
 
-    # Superficie solo para 'Punto de Muestreo' con Radio válido
-    mask_pm  = (df_met["Type"] == "Punto de Muestreo")
-    radios   = pd.to_numeric(df_met["Radio"], errors="coerce")
-    area_pm  = (np.pi * radios.pow(2)).round(0)
-    df_met.loc[mask_pm, "Superficie (m2)"] = area_pm
-
-    # ---------- B. Resto de transformaciones ----------
-    df_met["Número Réplica"]     = df_met.groupby(["nameest", "Type"]).cumcount() + 1
-    df_met["ID EstacionReplica"] = np.arange(1, len(df_met) + 1, dtype=int)
-    df_met["Ecosistema nivel 2"] = df_met["ambienteest"]
+    # Resto
+    dfm["Número Réplica"]     = dfm.groupby(["nameest", "Type"]).cumcount() + 1
+    dfm["ID EstacionReplica"] = np.arange(1, len(dfm) + 1, dtype=int)
+    dfm["Ecosistema nivel 2"] = dfm.get("ambienteest")
 
     def build_tipo_mon(row):
-        if row["Type"] in ("Transecto Lineal", "Play Back"):
-            return f"{row['Type']} - {row.get('Clase')}"
+        if row.get("Type") in ("Transecto Lineal", "Play Back"):
+            return f"{row.get('Type')} - {row.get('Clase')}"
         else:
-            return row["Type"]
+            return row.get("Type")
+    dfm["Tipo de monitoreo"] = dfm.apply(build_tipo_mon, axis=1)
 
-    df_met["Tipo de monitoreo"] = df_met.apply(build_tipo_mon, axis=1)
-
-    # Renombrar a los títulos que exige la plantilla
-    df_met = df_met.rename(columns={
+    dfm = dfm.rename(columns={
         "nameest":       "Nombre estación",
         "Observaciones": "Descripción EstacionReplica",
         "Ancho":         "Ancho (m)",
@@ -219,7 +225,6 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         "localidad":     "Localidad",
     })
 
-    # Diccionario “columna plantilla → índice Excel”
     cols_e = {
         "ID EstacionReplica": 1,  "Nombre estación": 2,     "Tipo de monitoreo": 3,
         "Número Réplica": 4,      "Descripción EstacionReplica": 5,
@@ -231,90 +236,70 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         "Región": 16, "Provincia": 17, "Comuna": 18, "Localidad": 19,
         "Ecosistema nivel 2": 21,
     }
-
-    # Nos aseguramos de que todas las columnas existan
+    # Garantiza columnas
     for c in cols_e:
-        if c not in df_met.columns:
-            df_met[c] = np.nan
+        if c not in dfm.columns:
+            dfm[c] = np.nan
 
-    # Limpiamos filas previas en la hoja Excel (si las hubiera)
-    if ws_e.max_row > 1:
-        ws_e.delete_rows(2, ws_e.max_row - 1)
+    ordered_cols_e = [c for c, _ in sorted(cols_e.items(), key=lambda kv: kv[1])]
+    df_e_write = dfm[ordered_cols_e].reset_index(drop=True)
 
-    # Escribimos fila por fila (índice limpio para no saltar filas)
-    for excel_row, (_, fila) in enumerate(df_met.reset_index(drop=True).iterrows(), start=2):
-        for col_name, col_idx in cols_e.items():
-            ws_e.cell(row=excel_row, column=col_idx, value=fila[col_name])
+    # ========== 3) OCURRENCIA (reemplazo completo) ==========
+    dfr = df_reg.copy()
+    dfr["Time"] = pd.to_datetime(dfr.get("Time"), errors="coerce")
 
-    # 3. Ocurrencia ---------------------------------------------
-    df_reg = df_reg.copy()
-    df_reg["Time"] = pd.to_datetime(df_reg["Time"], errors="coerce")
-
-    id_map = dict(zip(df_met.get("metodologiaID", []), df_met["ID EstacionReplica"]))
-    if "metodologiaID" in df_reg.columns:
-        df_reg["ID EstacionReplica"] = df_reg["metodologiaID"].map(id_map)
+    # map metodologiaID → ID EstacionReplica
+    id_map = {}
+    if "metodologiaID" in dfm.columns:
+        id_map = dict(zip(dfm.get("metodologiaID", pd.Series(index=[])).fillna(""), dfm["ID EstacionReplica"]))
+    if "metodologiaID" in dfr.columns:
+        dfr["ID EstacionReplica"] = dfr["metodologiaID"].map(id_map)
     else:
-        df_reg["ID EstacionReplica"] = np.nan
+        dfr["ID EstacionReplica"] = np.nan
 
-    # Excluir tipos de la hoja Ocurrencia
+    # Tipos a excluir
     EXCLUDE_TYPES = {
-        "Detección de Eco Localizaciones",   # ← nombre correcto
+        "Detección de Eco Localizaciones",
         "Trampas Sherman",
         "Trampas Cámara",
     }
 
-    # Mapeamos metodologiaID ➜ Type (si existe)
-    # ───────────── Propiedades dinámicas: 'Tránsito Aereo' ─────────────
-    if "metodologiaID" in df_met.columns and "metodologiaID" in df_reg.columns:
-        tipo_map = dict(zip(df_met["metodologiaID"], df_met["Type"]))
-        df_reg["Type"] = df_reg["metodologiaID"].map(tipo_map)
+    # Tipo por metodologiaID (si aplica) para filtrar exclusiones
+    if "metodologiaID" in dfm.columns and "metodologiaID" in dfr.columns:
+        tipo_map = dict(zip(dfm["metodologiaID"], dfm["Type"]))
+        dfr["Type"] = dfr["metodologiaID"].map(tipo_map)
 
-        # Construye Propiedades dinámicas solo para 'Tránsito Aereo'
+        # Propiedades dinámicas (Tránsito Aéreo)
         def _build_dyn(row):
             if row.get("Type") != "Tránsito Aéreo":
                 return ""
-            d = row.get("desdeEl")
-            h = row.get("haciaEl")
-            a = row.get("altura")
-            t = row.get("tipoVuelo")
-
+            d = row.get("desdeEl"); h = row.get("haciaEl")
+            a = row.get("altura");  t = row.get("tipoVuelo")
             parts = []
-            if pd.notna(d) and str(d).strip() != "":
-                parts.append(f"Desde = {d}")
-            if pd.notna(h) and str(h).strip() != "":
-                parts.append(f"Hacia = {h}")
-            if pd.notna(a) and str(a).strip() != "":
-                parts.append(f"Altura de vuelo (m) = {a}")
-            if pd.notna(t) and str(t).strip() != "":
-                parts.append(f"Tipo de vuelo = {t}")
+            if pd.notna(d) and str(d).strip() != "": parts.append(f"Desde = {d}")
+            if pd.notna(h) and str(h).strip() != "": parts.append(f"Hacia = {h}")
+            if pd.notna(a) and str(a).strip() != "": parts.append(f"Altura de vuelo (m) = {a}")
+            if pd.notna(t) and str(t).strip() != "": parts.append(f"Tipo de vuelo = {t}")
             return "; ".join(parts)
 
-        df_reg["Propiedades dinámicas"] = df_reg.apply(_build_dyn, axis=1)
+        dfr["Propiedades dinámicas"] = dfr.apply(_build_dyn, axis=1)
+        dfr = dfr[~dfr["Type"].isin(EXCLUDE_TYPES)].copy()
+        dfr.drop(columns=["Type"], inplace=True, errors="ignore")
+        dfr.reset_index(drop=True, inplace=True)
 
-        # Excluir metodologías no consideradas en Ocurrencia
-        EXCLUDE_TYPES = {
-            "Detección de Eco Localizaciones",
-            "Trampas Sherman",
-            "Trampas Cámara",
-        }
-        df_reg = df_reg[~df_reg["Type"].isin(EXCLUDE_TYPES)].copy()
-        df_reg.drop(columns=["Type"], inplace=True, errors="ignore")
-        df_reg.reset_index(drop=True, inplace=True)
+    dfr["Año del evento"]             = dfr["Time"].dt.year
+    dfr["Mes del evento"]             = dfr["Time"].dt.month
+    dfr["Día del evento"]             = dfr["Time"].dt.day
+    dfr["Hora inicio evento (hh:mm)"] = dfr["Time"].dt.strftime("%H:%M")
+    dfr["Hora registro"]              = dfr["Hora inicio evento (hh:mm)"]
+    dfr["Latitud decimal registro"]   = dfr.get("Coordinates").apply(lambda c: getattr(c, "latitude", None) if pd.notna(c) else None)
+    dfr["Longitud decimal registro"]  = dfr.get("Coordinates").apply(lambda c: getattr(c, "longitude", None) if pd.notna(c) else None)
 
-
-    df_reg["Año del evento"]             = df_reg["Time"].dt.year
-    df_reg["Mes del evento"]             = df_reg["Time"].dt.month
-    df_reg["Día del evento"]             = df_reg["Time"].dt.day
-    df_reg["Hora inicio evento (hh:mm)"] = df_reg["Time"].dt.strftime("%H:%M")
-    df_reg["Hora registro"]              = df_reg["Hora inicio evento (hh:mm)"]
-    df_reg["Latitud decimal registro"]   = df_reg["Coordinates"].apply(lambda c: getattr(c,"latitude",None))
-    df_reg["Longitud decimal registro"]  = df_reg["Coordinates"].apply(lambda c: getattr(c,"longitude",None))
-
-    df_reg["ID Campaña"]         = 1
-    df_reg["Nombre campaña"]     = camp.get("Name")
-    df_reg["Muestreado por"]     = "AMS Consultores"
-    df_reg["Identificado por"]   = "AMS Consultores"
-    df_reg["Epíteto específico"] = df_reg.get("epiteto")
+    dfr["ID Campaña"]       = 1
+    dfr["Nombre campaña"]   = camp.get("Name")
+    dfr["Muestreado por"]   = "AMS Consultores"
+    dfr["Identificado por"] = "AMS Consultores"
+    dfr["Epíteto específico"] = dfr.get("epiteto")
 
     campos_o = {
         1:"ID Campaña",2:"Nombre campaña",3:"ID EstacionReplica",
@@ -337,20 +322,25 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         41:"tipoRegistro",
         44:"Muestreado por",45:"Identificado por",
     }
-    for col in campos_o.values():
-        if col not in df_reg.columns:
-            df_reg[col] = ""
+    for col in set(campos_o.values()):
+        if col not in dfr.columns:
+            dfr[col] = ""
 
-    if ws_o.max_row > 2:
-        ws_o.delete_rows(3, ws_o.max_row - 2)
+    ordered_cols_o = [col for _, col in sorted(campos_o.items(), key=lambda kv: kv[0])]
+    df_o_write = dfr[ordered_cols_o].reset_index(drop=True)
 
-    for excel_row, (_, row) in enumerate(df_reg.reset_index(drop=True).iterrows(), start=3):
-        for idx, col in campos_o.items():
-            ws_o.cell(row=excel_row, column=idx, value=row[col])
+    # ========== Escritura con pandas ==========
+    # Reemplazamos por completo EstacionReplica y Ocurrencia (incluye encabezados)
+    with pd.ExcelWriter(out_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+        df_e_write.to_excel(
+            xw, sheet_name="EstacionReplica", index=False, header=True
+        )
+        # En plantilla original 'Ocurrencia' suele tener 2 filas de encabezado;
+        # aquí se escribe un header plano (pandas). Ajusta si necesitas dos filas.
+        df_o_write.to_excel(
+            xw, sheet_name="Ocurrencia", index=False, header=True
+        )
 
-    # Guardar archivo
-    out_path = DOWNLOAD_DIR / out_name
-    wb.save(out_path)
     return out_path
 
 # ────────────────────────────────  Endpoint
@@ -363,15 +353,16 @@ def export_excel(request: Request, campana_id: str = Query(...)):
     if df_camp.empty or df_met.empty or df_reg.empty:
         raise HTTPException(status_code=404, detail="No hay datos para la campaña.")
 
-    # Bloque limpiador (sin applymap deprecado)
+    # Limpia valores “NO DATA”/999999
     df_met = df_met.apply(lambda col: col.map(_to_none))
     df_reg = df_reg.apply(lambda col: col.map(_to_none))
 
     filename = f"DWC_{_safe_filename(campana_id)}_{uuid.uuid4().hex[:6]}.xlsx"
-    path     = generar_excel(df_camp, df_met, df_reg, filename)
+    path     = generar_excel_pandas(df_camp, df_met, df_reg, filename)
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

@@ -174,7 +174,8 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_met.loc[mask_tl, "Longitud decimal inicio"]  = df_met["startCoordTL"].map(get_lon)
     df_met.loc[mask_tl, "Latitud decimal término"]  = df_met["endCoordTL"].map(get_lat)
     df_met.loc[mask_tl, "Longitud decimal término"] = df_met["endCoordTL"].map(get_lon)
-
+    df_met.loc[mask_tl, "Largo (m)"] = df_met.loc[mask_tl, "largo"]
+  
     # Otras metodologías → coordenada central
     mask_otras = ~mask_tl
     df_met.loc[mask_otras, "Latitud decimal central"]  = df_met["centralCoordinate"].map(get_lat)
@@ -371,6 +372,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

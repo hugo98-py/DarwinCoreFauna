@@ -314,7 +314,13 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 
     df_reg["ID Campaña"]         = 1
     df_reg["Nombre campaña"]     = camp.get("Name")
-    df_reg["Muestreado por"]     = "AMS Consultores"
+    # Campo Muestreado por
+    if "muestreadoPor" in df_reg.columns:
+      # Usa el valor del campo; si viene vacío/None, pone un texto genérico
+      df_reg["Muestreado por"] = df_reg["muestreadoPor"].fillna("AMS Consultores")
+    else:
+      # Si la columna no existe, deja un valor por defecto
+      df_reg["Muestreado por"] = "AMS Consultores"
     df_reg["Identificado por"]   = "AMS Consultores"
     df_reg["Epíteto específico"] = df_reg.get("epiteto")
 
@@ -386,6 +392,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

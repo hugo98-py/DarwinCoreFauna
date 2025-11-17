@@ -362,6 +362,18 @@ def export_excel(request: Request, campana_id: str = Query(...)):
     df_met  = fetch_df("Metodologia", campana_id)
     df_reg  = fetch_df("Registro",    campana_id)
 
+    # ───── FILTRAR REGISTROS COMPLETADOS ─────
+    if "isRegCompleted" in df_reg.columns:
+      df_reg = df_reg[df_reg["isRegCompleted"] == "Completed"].copy()
+
+      # Si filtrar deja el DF vacío, disparamos error para evitar Excel sin datos
+      if df_reg.empty:
+          raise HTTPException(
+              status_code=404,
+              detail="No hay registros completados en esta campaña."
+          )
+
+
     if df_camp.empty or df_met.empty or df_reg.empty:
         raise HTTPException(status_code=404, detail="No hay datos para la campaña.")
 
@@ -374,6 +386,7 @@ def export_excel(request: Request, campana_id: str = Query(...)):
 
     download_url = f"{str(request.base_url).rstrip('/')}/downloads/{path.name}"
     return JSONResponse({"download_url": download_url})
+
 
 
 

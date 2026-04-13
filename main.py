@@ -220,6 +220,19 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         "comuna":        "Comuna",
         "localidad":     "Localidad",
     })
+    df_met["AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"] = (
+      df_met["Nombre estación"].fillna("").astype(str).str.strip()
+      + " - " +
+      df_met["Número Réplica"].fillna("").astype(str).str.strip()
+      + " - " +
+      df_met["Tipo de monitoreo"].fillna("").astype(str).str.strip()
+  )
+
+  # Opcional: si quieres emular el SI(C11="";"";...)
+  df_met.loc[
+      df_met["ID EstacionReplica"].isna(),
+      "AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"
+  ] = ""
 
     # Diccionario “columna plantilla → índice Excel”
     cols_e = {
@@ -257,6 +270,18 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
         df_reg["ID EstacionReplica"] = df_reg["metodologiaID"].map(id_map)
     else:
         df_reg["ID EstacionReplica"] = np.nan
+
+    auto_map = dict(zip(
+      df_met["metodologiaID"],
+      df_met["AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"]
+    ))
+
+    if "metodologiaID" in df_reg.columns:
+      df_reg["AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"] = (
+         df_reg["metodologiaID"].map(auto_map).fillna("ID NO EXISTE")
+      )
+    else:
+      df_reg["AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"] = ""
 
     # Excluir tipos de la hoja Ocurrencia
     EXCLUDE_TYPES = {
@@ -325,25 +350,41 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_reg["Epíteto específico"] = df_reg.get("epiteto")
 
     campos_o = {
-        1:"ID Campaña",2:"Nombre campaña",3:"ID EstacionReplica",
-        5:"Año del evento",6:"Mes del evento",7:"Día del evento",
+        1:"ID Campaña",
+        2:"Nombre campaña",
+        3:"ID EstacionReplica",
+        4:"AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo",
+        5:"Año del evento",
+        6:"Mes del evento",
+        7:"Día del evento",
         8:"Hora inicio evento (hh:mm)",
         9:"protocoloMuestreo",
-        10:"tamanoMuestra",11:"unidadTamanoMuestra",
+        10:"tamanoMuestra",
+        11:"unidadTamanoMuestra",
         14:"comentario",
-        15:"reino",16:"division",17:"clase",18:"orden",
-        19:"familia",20:"genero",
-        22:"epiteto",24:"nombreComun",
+        15:"reino",
+        16:"division",
+        17:"clase",
+        18:"orden",
+        19:"familia",
+        20:"genero",
+        22:"epiteto",
+        24:"nombreComun",
         26:"estadoOrganismo",
-        28:"parametro",29:"tipoCuantificacion",
-        30:"valor",31:"unidadValor",
-        32:"Latitud decimal registro",33:"Longitud decimal registro",
+        28:"parametro",
+        29:"tipoCuantificacion",
+        30:"valor",
+        31:"unidadValor",
+        32:"Latitud decimal registro",
+        33:"Longitud decimal registro",
         34:"Hora registro",
         35:"condicionReproductiva",
-        36:"sexo",37:"etapaVida",
+        36:"sexo",
+        37:"etapaVida",
         40:"Propiedades dinámicas",
         41:"tipoRegistro",
-        44:"Muestreado por",45:"Identificado por",
+        44:"Muestreado por",
+        45:"Identificado por",
     }
     for col in campos_o.values():
         if col not in df_reg.columns:

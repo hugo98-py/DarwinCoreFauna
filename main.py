@@ -202,10 +202,12 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
     df_met["Ecosistema nivel 2"] = df_met["ambienteest"]
 
     def build_tipo_mon(row):
-        if row["Type"] in ("Transecto Lineal", "Play Back"):
-            return f"{row['Type']} - {row.get('Clase')}"
+        if row["Type"] == "Transecto Lineal":
+            return "Transecta"
+        elif row["Type"] in ("Play Back", "Tránsito Aéreo"):
+            return "Área"
         else:
-            return row["Type"]
+            return "Registro individual"
 
     df_met["Tipo de monitoreo"] = df_met.apply(build_tipo_mon, axis=1)
 

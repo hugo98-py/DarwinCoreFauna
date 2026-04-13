@@ -230,8 +230,8 @@ def generar_excel(df_camp, df_met, df_reg, out_name: str) -> Path:
 
   # Opcional: si quieres emular el SI(C11="";"";...)
   df_met.loc[
-      df_met["ID EstacionReplica"].isna(),
-      "AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"
+    df_met["ID EstacionReplica"].isna(),
+    "AUTOCOMPLETADO NombreEstacion-Número Replica-Tipo de monitoreo"
   ] = ""
 
     # Diccionario “columna plantilla → índice Excel”
